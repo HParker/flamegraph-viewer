@@ -1,0 +1,42 @@
+app   100/100   1.000000000:          1 cycles:Pu:
+	0000000000000020 alpha (/app/bin)
+	0000000000000020 alpha (/app/bin)
+	0000000000000010 main (/app/bin)
+
+app   100/100   1.001000000:          1 cycles:Pu:
+	0000000000000020 alpha (/app/bin)
+	0000000000000020 alpha (/app/bin)
+	0000000000000010 main (/app/bin)
+
+app   100/100   1.002000000:          1 cycles:Pu:
+	0000000000000030 beta (/app/bin)
+	0000000000000020 alpha (/app/bin)
+	0000000000000010 main (/app/bin)
+
+app   100/100   1.003000000:          1 cycles:Pu:
+	0000000000000040 gamma (/app/bin)
+	0000000000000010 main (/app/bin)
+
+app   100/100   1.004000000:          1 cycles:Pu:
+	0000000000000040 gamma (/app/bin)
+	0000000000000010 main (/app/bin)
+
+app   100/100   1.005000000:          1 cycles:Pu:
+	0000000000000040 gamma (/app/bin)
+	0000000000000010 main (/app/bin)
+
+app   100/100   1.006000000:          1 cycles:Pu:
+	00000000000000a0 [unknown] ([unknown])
+	0000000000000010 main (/app/bin)
+
+worker   100/101   1.000500000:          1 cycles:Pu:
+	0000000000000050 worker_x (/app/bin)
+	0000000000000060 worker (/app/bin)
+
+worker   100/101   1.001500000:          1 cycles:Pu:
+	0000000000000050 worker_x (/app/bin)
+	0000000000000060 worker (/app/bin)
+
+worker   100/101   1.002500000:          1 cycles:Pu:
+	0000000000000050 worker_x (/app/bin)
+	0000000000000060 worker (/app/bin)

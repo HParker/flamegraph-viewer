@@ -1,0 +1,24 @@
+app   1/1   0.001000:          5 cpu/cycles/Pu: 
+	0000000000000028 alpha+0x8 (/app/bin)
+	0000000000000024 alpha+0x4 (/app/bin)
+	0000000000000010 main+0x10 (/app/bin)
+
+app   1/1   0.002000:          3 cpu/cycles/Pu: 
+	0000000000000024 alpha+0x4 (/app/bin)
+	0000000000000010 main+0x10 (/app/bin)
+
+app   1/1   0.003000:          2 cpu/cycles/Pu: 
+	0000000000000040 gamma+0x0 (/app/bin)
+	0000000000000010 main+0x10 (/app/bin)
+
+app   1/1   0.004000:         10 cpu/cycles/Pu: 
+	0000000000000040 gamma+0x0 (/app/bin)
+	0000000000000010 main+0x10 (/app/bin)
+
+worker   1/2   0.001500:          4 cpu/cycles/Pu: 
+	000000000000005c spin+0x1c (/app/bin)
+	0000000000000050 worker+0x0 (/app/bin)
+
+worker   1/2   0.002500:          6 cpu/cycles/Pu: 
+	000000000000005c spin+0x1c (/app/bin)
+	0000000000000050 worker+0x0 (/app/bin)

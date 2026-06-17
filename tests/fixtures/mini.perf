@@ -1,0 +1,15 @@
+app	1/1	0.000001:	1 cpu/cycles:
+	a leaf_a (app)
+	r root (app)
+
+app	1/1	0.000002:	1 cpu/cycles:
+	b leaf_b (app)
+	r root (app)
+
+app	1/1	0.000003:	1 cpu/cycles:
+	a leaf_a (app)
+	r root (app)
+
+worker	1/2	0.0000015:	1 cpu/cycles:
+	c work (app)
+	r root (app)

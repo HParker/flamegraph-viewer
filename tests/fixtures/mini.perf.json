@@ -1,0 +1,26 @@
+{
+  "linux-perf-json-version": 1,
+  "headers": { "header-version": 1 },
+  "samples": [
+    { "timestamp": 1000, "pid": 1, "tid": 1, "comm": "app",
+      "callchain": [
+        { "ip": "0xa", "symbol": "leaf_a", "dso": "app" },
+        { "ip": "0xr", "symbol": "root", "dso": "app" }
+      ] },
+    { "timestamp": 2000, "pid": 1, "tid": 1, "comm": "app",
+      "callchain": [
+        { "ip": "0xb", "symbol": "leaf_b", "dso": "app" },
+        { "ip": "0xr", "symbol": "root", "dso": "app" }
+      ] },
+    { "timestamp": 3000, "pid": 1, "tid": 1, "comm": "app",
+      "callchain": [
+        { "ip": "0xa", "symbol": "leaf_a", "dso": "app" },
+        { "ip": "0xr", "symbol": "root", "dso": "app" }
+      ] },
+    { "timestamp": 1500, "pid": 1, "tid": 2, "comm": "worker",
+      "callchain": [
+        { "ip": "0xc", "symbol": "work", "dso": "app" },
+        { "ip": "0xr", "symbol": "root", "dso": "app" }
+      ] }
+  ]
+}

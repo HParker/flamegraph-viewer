@@ -1,0 +1,31 @@
+{
+  "meta": {
+    "preprocessedProfileVersion": 47,
+    "interval": 1,
+    "sampleUnits": { "time": "ms" }
+  },
+  "threads": [
+    {
+      "name": "app",
+      "pid": 1,
+      "tid": 1,
+      "stringArray": ["leaf_a", "leaf_b", "root", "app", "work"],
+      "funcTable": {
+        "name": [0, 1, 2, 4],
+        "fileName": [3, 3, 3, 3]
+      },
+      "frameTable": {
+        "func": [0, 1, 2, 3],
+        "address": [-1, -1, -1, -1]
+      },
+      "stackTable": {
+        "frame": [2, 0, 1, 3],
+        "prefix": [null, 0, 0, 0]
+      },
+      "samples": {
+        "stack": [1, 2, 1],
+        "time": [0.001, 0.002, 0.003]
+      }
+    }
+  ]
+}

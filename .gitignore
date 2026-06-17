@@ -1,1 +1,8 @@
 /target
+
+# Large real-world sample profiles are not committed (use scripts/validate.sh
+# locally when present). Small fixtures live in tests/fixtures/ instead.
+/app-dev-boot-vernier.json
+/perf.json
+/out.perf
+/big.perf
