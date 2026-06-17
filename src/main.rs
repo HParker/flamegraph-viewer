@@ -15,8 +15,8 @@
 //! * `C` / `V`  – zoom out / in (depth axis)
 //! * `[` / `]`  – switch to the previous / next thread
 //! * hover      – highlight the brick under the cursor and every brick that
-//!   shares its symbol / instruction pointer
-//! * click      – show the function's self and total time (and event share)
+//!   shares its symbol / instruction pointer, and show the function's self and
+//!   total time (and event share)
 //!
 //! In the flame chart a faint vertical tick marks the timestamp of each sample.
 //! Hold `Alt` to annotate the tick nearest the cursor with its timestamp. The
@@ -56,9 +56,15 @@ const BRICK_FILL: f32 = 0.9;
 const VERTICAL_MARGIN: f32 = 80.0;
 
 const LABEL_FONT_SIZE: f32 = 12.0;
-/// Rough average glyph advance for the default font, used to estimate how many
-/// characters fit inside a brick.
-const LABEL_CHAR_WIDTH: f32 = LABEL_FONT_SIZE * 0.5;
+/// Upper bound for brick label fonts: taller rows grow the text up to here so
+/// it stays legible without overflowing the brick.
+const MAX_LABEL_FONT: f32 = 24.0;
+/// Fraction of a brick's height used for its label font, so taller rows render
+/// larger, more readable text (see [`label_font_size`]).
+const LABEL_FILL: f32 = 0.7;
+/// Rough average glyph advance for the default font as a fraction of the font
+/// size, used to estimate how many characters fit inside a brick.
+const LABEL_CHAR_RATIO: f32 = 0.5;
 const LABEL_PADDING: f32 = 2.0;
 
 /// Bricks narrower than this many pixels at the initial fit scale are not
@@ -350,7 +356,7 @@ fn main() {
                 resize_top_font,
                 update_hover,
                 update_tick_annotation,
-                handle_click,
+                update_info_panel,
             )
                 .chain(),
         )
@@ -415,13 +421,15 @@ fn setup(
     ));
 
     commands.spawn((
-        Text::new("Click a brick to see its timing"),
+        Text::new("Hover a brick to see its timing"),
         panel_font,
-        TextColor(Color::srgb(0.8, 0.8, 0.85)),
+        TextColor(Color::srgb(0.85, 0.85, 0.9)),
+        BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.6)),
         Node {
             position_type: PositionType::Absolute,
             top: Val::Px(8.0),
             right: Val::Px(8.0),
+            padding: UiRect::all(Val::Px(6.0)),
             ..default()
         },
         InfoPanel,
@@ -600,10 +608,11 @@ fn thread_timing_summary(profile: &Profile, thread: &Thread) -> String {
     }
 }
 
-/// Render every thread as a small left-heavy flame-graph thumbnail arranged in a
-/// grid, highlighting the currently selected cell. Also records each cell's
-/// world rectangle in [`OverviewLayout`] so the keyboard and mouse selection
-/// systems agree on where each thread is. The grid is laid out roughly square.
+/// Render every thread as a full-width time-ordered flame-chart preview, one per
+/// row stacked top-to-bottom, highlighting the currently selected row. All rows
+/// share one global time axis so equal wall-clock times line up vertically. Also
+/// records each cell's world rectangle in [`OverviewLayout`] so the keyboard and
+/// mouse selection systems agree on where each thread is.
 fn spawn_overview(
     commands: &mut Commands,
     shared: &SharedAssets,
@@ -618,15 +627,21 @@ fn spawn_overview(
         return;
     }
 
-    let cols = (n as f32).sqrt().ceil() as usize;
-    let rows = n.div_ceil(cols);
+    // One full-width row per thread, stacked top-to-bottom (a single column).
+    let cols = 1usize;
+    let rows = n;
     layout.cols = cols;
+
+    // A shared global time axis so a sample at a given wall-clock time lines up
+    // vertically across every thread's row.
+    let profile_start = profile.start_ns().unwrap_or(0.0);
+    let profile_span = profile.span_ns();
 
     let left = -X_EXTENT + OVERVIEW_MARGIN;
     let top = Y_EXTENT - OVERVIEW_TOP_MARGIN;
     let area_w = 2.0 * X_EXTENT - 2.0 * OVERVIEW_MARGIN;
     let area_h = (Y_EXTENT - OVERVIEW_TOP_MARGIN) - (-Y_EXTENT + OVERVIEW_MARGIN);
-    let cell_w = area_w / cols as f32;
+    let cell_w = area_w;
     let cell_h = area_h / rows as f32;
 
     for (slot, &thread_idx) in view.order.iter().enumerate() {
@@ -666,6 +681,8 @@ fn spawn_overview(
             center,
             inner_w,
             inner_h - label_h,
+            profile_start,
+            profile_span,
         );
 
         // Thread label across the top of the cell.
@@ -689,10 +706,15 @@ fn spawn_overview(
     }
 }
 
-/// Draw one thread's left-heavy flame graph scaled to fit a thumbnail centred at
-/// `center`, occupying `width` × `height` world units (the flame grows up from
-/// the bottom of that box). Sub-pixel bricks are dropped to bound the entity
-/// count for very busy threads.
+/// Draw one thread's time-ordered flame chart scaled to fit a thumbnail centred
+/// at `center`, occupying `width` × `height` world units (the flame grows up from
+/// the bottom of that box). This matches the detailed flame chart a click opens,
+/// so the thumbnail and the opened view share the same time-series layout.
+///
+/// `width` maps the whole profile timeline (`profile_start` .. `profile_start +
+/// profile_span`), so every row shares one x scale: a thread that begins later
+/// starts further right, and equal wall-clock times line up vertically across
+/// rows. Sub-pixel bricks are dropped to bound the entity count for busy threads.
 fn spawn_thumbnail(
     commands: &mut Commands,
     shared: &SharedAssets,
@@ -700,18 +722,27 @@ fn spawn_thumbnail(
     center: Vec2,
     width: f32,
     height: f32,
+    profile_start: f64,
+    profile_span: f64,
 ) {
-    let bricks = flame::left_heavy(thread);
-    let total: f64 = bricks
-        .iter()
-        .map(|b| b.start_ns + b.width_ns)
-        .fold(0.0, f64::max);
+    if profile_span <= 0.0 || width <= 0.0 {
+        return;
+    }
+    // Shared time-to-pixel scale: one thumbnail pixel is this many ns, used both
+    // to cull sub-pixel bricks up front and to place every row on one axis.
+    let xscale = width / profile_span as f32;
+    let min_width_ns = OVERVIEW_MIN_BRICK_PX as f64 / xscale as f64;
+
+    let bricks = flame::layout(thread, min_width_ns);
     let max_depth = bricks.iter().map(|b| b.depth).max().unwrap_or(0);
-    if total <= 0.0 || max_depth == 0 {
+    if max_depth == 0 {
         return;
     }
 
-    let xscale = width / total as f32;
+    // Offset of this thread's first sample from the profile start; brick
+    // `start_ns` values are relative to that first sample (see `flame::layout`).
+    let thread_offset = thread.first_timestamp_ns().unwrap_or(profile_start) - profile_start;
+
     let row_h = height / max_depth as f32;
     let flame_left = center.x - width / 2.0;
     let flame_bottom = center.y - height / 2.0;
@@ -721,7 +752,8 @@ fn spawn_thumbnail(
         if bw < OVERVIEW_MIN_BRICK_PX {
             continue;
         }
-        let bx = flame_left + (brick.start_ns + brick.width_ns / 2.0) as f32 * xscale;
+        let center_ns = thread_offset + brick.start_ns + brick.width_ns / 2.0;
+        let bx = flame_left + center_ns as f32 * xscale;
         let by = flame_bottom + (brick.depth as f32 - 0.5) * row_h;
         let material = shared.palette[palette_index(thread.key(brick.frame))].clone();
         let mut transform = Transform::from_xyz(bx, by, 0.0);
@@ -931,7 +963,8 @@ fn spawn_brick(
     // A label entity is created whenever the brick is wide enough to hold text;
     // whether the text is actually shown also depends on the row being tall
     // enough (see `labels_visible`), so depth-zooming can reveal it later.
-    let fitted = fit_label(&full, brick.width_ns, scale);
+    let font_size = label_font_size(row_height);
+    let fitted = fit_label(&full, brick.width_ns, scale, font_size);
     if fitted.is_empty() {
         return;
     }
@@ -942,7 +975,7 @@ fn spawn_brick(
     };
     commands.spawn((
         Text2d::new(text),
-        TextFont::from_font_size(LABEL_FONT_SIZE),
+        TextFont::from_font_size(font_size),
         Anchor::CENTER_LEFT,
         Transform::from_xyz(
             label_left_x(brick.start_ns, scale),
@@ -976,6 +1009,12 @@ fn labels_visible(row_height: f32) -> bool {
     brick_thickness(row_height) >= LABEL_FONT_SIZE
 }
 
+/// Brick label font size, scaled to the brick height so taller rows get larger,
+/// more legible text, bounded by [`LABEL_FONT_SIZE`] and [`MAX_LABEL_FONT`].
+fn label_font_size(row_height: f32) -> f32 {
+    (brick_thickness(row_height) * LABEL_FILL).clamp(LABEL_FONT_SIZE, MAX_LABEL_FONT)
+}
+
 /// World-space x of a brick's centre.
 fn brick_center_x(start_ns: f64, width_ns: f64, scale: f32) -> f32 {
     -X_EXTENT + (start_ns + width_ns / 2.0) as f32 * scale
@@ -995,9 +1034,10 @@ fn palette_index(key: &str) -> usize {
 
 /// Truncate `full` to fit a brick `width_ns` wide at `scale`, appending ".."
 /// when characters are dropped. Empty when not even one character fits.
-fn fit_label(full: &str, width_ns: f64, scale: f32) -> String {
+fn fit_label(full: &str, width_ns: f64, scale: f32, font_size: f32) -> String {
     let usable = width_ns as f32 * scale - 2.0 * LABEL_PADDING;
-    let max_chars = (usable / LABEL_CHAR_WIDTH).floor();
+    let char_width = font_size * LABEL_CHAR_RATIO;
+    let max_chars = (usable / char_width).floor();
     if max_chars < 1.0 {
         return String::new();
     }
@@ -1117,7 +1157,7 @@ fn zoom_samples(
     time: Res<Time>,
     mut row_height: ResMut<RowHeight>,
     mut bricks: Query<(&mut Transform, &mut TrueScale), Without<BrickLabel>>,
-    mut labels: Query<(&mut Transform, &mut Text2d, &mut BrickLabel), Without<TrueScale>>,
+    mut labels: Query<(&mut Transform, &mut Text2d, &mut TextFont, &mut BrickLabel), Without<TrueScale>>,
 ) {
     let rate = 1.5 * time.delta_secs();
     let time_factor = axis_factor(&keyboard, KeyCode::KeyX, KeyCode::KeyZ, rate);
@@ -1132,6 +1172,7 @@ fn zoom_samples(
 
     let row_height = row_height.0;
     let show_labels = labels_visible(row_height);
+    let font_size = label_font_size(row_height);
     for (mut transform, mut scale) in &mut bricks {
         scale.scale *= time_factor;
         transform.translation.x = brick_center_x(scale.start_ns, scale.width_ns, scale.scale);
@@ -1140,12 +1181,13 @@ fn zoom_samples(
         transform.scale.y = brick_thickness(row_height);
     }
 
-    for (mut transform, mut text, mut label) in &mut labels {
+    for (mut transform, mut text, mut font, mut label) in &mut labels {
         label.scale *= time_factor;
         transform.translation.x = label_left_x(label.start_ns, label.scale);
         transform.translation.y = brick_y(label.depth, row_height);
+        font.font_size = font_size;
         text.0 = if show_labels {
-            fit_label(&label.full, label.width_ns, label.scale)
+            fit_label(&label.full, label.width_ns, label.scale, font_size)
         } else {
             String::new()
         };
@@ -1353,36 +1395,16 @@ fn update_tick_annotation(
     }
 }
 
-/// On left click, show the clicked function's time and event share.
-fn handle_click(
-    buttons: Res<ButtonInput<MouseButton>>,
-    windows: Query<&Window, With<PrimaryWindow>>,
-    cameras: Query<(&Camera, &GlobalTransform)>,
+/// Update the info panel with the hovered function's time and event share.
+fn update_info_panel(
+    hover: Res<Hover>,
     stats: Res<FuncStats>,
-    bricks: Query<(Entity, &Transform, &BrickView)>,
     mut panel: Query<&mut Text, With<InfoPanel>>,
 ) {
-    if !buttons.just_pressed(MouseButton::Left) {
+    if !hover.is_changed() {
         return;
     }
-    let Ok(window) = windows.single() else {
-        return;
-    };
-    let Ok((camera, camera_transform)) = cameras.single() else {
-        return;
-    };
-    let Some(point) = cursor_world(window, camera, camera_transform) else {
-        return;
-    };
-
-    let Some((_, key)) = brick_at(point, bricks.iter()) else {
-        return;
-    };
-
     let Ok(mut text) = panel.single_mut() else {
-        return;
-    };
-    let Some(stat) = stats.by_key.get(key) else {
         return;
     };
     let pct = |events: u64| {
@@ -1392,17 +1414,28 @@ fn handle_click(
             events as f64 / stats.total_events as f64 * 100.0
         }
     };
-    text.0 = format!(
-        "{key}\n\
-         self:  {} ({:.1}%, {} ev)\n\
-         total: {} ({:.1}%, {} ev)",
-        format_ns(stat.self_ns),
-        pct(stat.self_events),
-        stat.self_events,
-        format_ns(stat.total_ns),
-        pct(stat.total_events),
-        stat.total_events,
-    );
+    match hover
+        .key
+        .as_deref()
+        .and_then(|key| stats.by_key.get(key).map(|stat| (key, stat)))
+    {
+        Some((key, stat)) => {
+            text.0 = format!(
+                "{key}\n\
+                 self:  {} ({:.1}%, {} ev)\n\
+                 total: {} ({:.1}%, {} ev)",
+                format_ns(stat.self_ns),
+                pct(stat.self_events),
+                stat.self_events,
+                format_ns(stat.total_ns),
+                pct(stat.total_events),
+                stat.total_events,
+            );
+        }
+        None => {
+            text.0 = String::from("Hover a brick to see its timing");
+        }
+    }
 }
 
 /// Human-readable duration from nanoseconds.
