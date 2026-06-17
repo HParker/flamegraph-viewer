@@ -31,14 +31,12 @@ struct PerfData {
     linux_perf_json_version: usize
 }
 
-#[derive(Serialize, Deserialize, Hash, PartialEq, Eq, Debug)]
+#[derive(Serialize, Deserialize, Hash, PartialEq, Eq, Debug, Clone)]
 struct CallFrame {
     ip: String,
     symbol: Option<String>,
     dso: Option<String>
 }
-
-
 
 #[derive(Serialize, Deserialize)]
 struct PerfSample {
@@ -58,124 +56,64 @@ struct FGraph {
     dso: Option<String>
 }
 
-struct Flamegraph {
-    // metadata,
-    graph: HashMap<(usize, usize), HashMap<String, FGraph>>,
+// struct Flamegraph {
+//     // metadata,
+//     graph: HashMap<(usize, usize), HashMap<String, FGraph>>,
+// }
+
+#[derive(Component)]
+struct HoverText(CallFrame);
+
+#[derive(Component)]
+struct Tooltip;
+
+#[derive(Component)]
+struct TrueScale {
+    x: usize,
+    width: usize,
+    scale: f32,
 }
 
-// draw verticle in terminal for now
-// callstack -> samples
-fn to_flamegraph(samples: Vec<PerfSample>) {
-    let mut call_graph: HashMap<Vec<String>, f64> = HashMap::new();
-
-    let pid = 64477;
-    let tid = 64477;
-
-    let mut time_sum = 0;
-    let mut prev_timestamp: Option<usize> = None;
-
-    for sample in &samples {
-	if sample.pid == pid && sample.tid == tid {
-	    match prev_timestamp {
-		Some(ps) => {
-		    time_sum += sample.timestamp - ps;
-		    prev_timestamp = Some(sample.timestamp)
-		}
-		None => {
-		    prev_timestamp = Some(sample.timestamp)
-		}
-	    }
-	}
-    }
-
-    prev_timestamp = None;
-    for sample in &samples {
-	if sample.pid == pid && sample.tid == tid {
-	    match prev_timestamp {
-		Some(ps) => {
-		    let cc: Vec<&String> = sample.callchain.iter().rev().map(|callframe| match &callframe.symbol { Some(symbol) => symbol, None => &callframe.ip }).collect();
-		    println!("{:?} : {}/{} ({:.2}%)", cc, sample.timestamp - ps, time_sum, ((sample.timestamp - ps) as f64 / time_sum as f64) * 100.0);
-		    prev_timestamp = Some(sample.timestamp)
-		}
-		None => {
-		    prev_timestamp = Some(sample.timestamp)
-		}
-	    }
-	}
-    }
-}
-
-// self and total time counting
-fn to_graph(samples: Vec<PerfSample>) {
-    let mut root = Flamegraph {
-	graph: HashMap::new()
-    };
-
-    for sample in samples {
-	match root.graph.get_mut(&(sample.pid, sample.tid)) {
-	    Some(thread_profile) => {
-		let mut self_sample = true;
-		for frame in sample.callchain {
-		    match thread_profile.get_mut(&frame.ip) {
-			Some(child) => {
-			    child.total_samples += 1;
-			    if self_sample {
-				child.self_samples += 1;
-			    }
-			},
-			None => {
-			    let new_frame = FGraph {
-				total_samples: 1,
-				self_samples: if self_sample { 1 } else { 0 },
-				ip: frame.ip.clone(),
-				symbol: frame.symbol.clone(),
-				dso: frame.dso.clone(),
-			    };
-			    thread_profile.insert(frame.ip.clone(), new_frame);
-			},
-		    }
-		    self_sample = false;
-		}
-	    }
-	    None => {
-		root.graph.insert((sample.pid, sample.tid), HashMap::new());
-		// TODO: insert sample
-	    }
-	}
-    }
-
-    let pid = 64477;
-    let tid = 64489;
-
-    let thread_data = root.graph.get(&(pid, tid)).unwrap();
-
-    let mut sorted_vec: Vec<(&String, &FGraph)> = thread_data.iter().collect();
-    sorted_vec.sort_unstable_by(|a, b| a.1.total_samples.cmp(&b.1.total_samples));
-
-    println!("-----------------------------------------------------------------");
-
-    sorted_vec.sort_unstable_by(|a, b| a.1.self_samples.cmp(&b.1.self_samples));
-
-    for (key, value) in &sorted_vec {
-        println!("{}: {:?}", key, value);
-    }
-}
-
-const X_EXTENT: f32 = 1100.;
-const Y_EXTENT: f32 = 500.;
+const X_EXTENT: f32 = 1600.;
+const Y_EXTENT: f32 = 900.;
 
 fn setup(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<ColorMaterial>>,
 ) {
-    commands.spawn(Camera2d);
+    // commands.spawn(Camera2d);
+    commands.spawn(Camera2d::default());
 
     let input = fs::read_to_string("perf.json").unwrap();
     let v: PerfData = serde_json::from_str(&input).unwrap();
 
     let pid = 64477;
     let tid = 64477;
+
+    // TODO: assert more than 3 samples
+    let sample_len = v.samples.len();
+
+    let first_samp: usize = v.samples[0].timestamp;
+    let last_samp: usize = v.samples.last().unwrap().timestamp;
+
+    let mut sample_weight: Vec<usize> = vec![];
+    // sample_weight.push(v.samples[1].timestamp - v.samples[0].timestamp);
+    for window in v.samples.windows(2) {
+        let before = window[0].timestamp;
+        let after = window[1].timestamp;
+        let weight = after - before;
+        sample_weight.push(weight);
+    }
+    // sample_weight.push((v.samples[sample_len - 1].timestamp - v.samples[sample_len - 2].timestamp) / 2);
+    sample_weight.push(v.samples[sample_len - 1].timestamp - v.samples[sample_len - 2].timestamp);
+
+    // sample start
+    let mut sample_start: Vec<usize> = vec![];
+    let mut debug_width = 0;
+    for sample in v.samples.iter() {
+        sample_start.push(sample.timestamp - first_samp);
+    }
 
     let mut max_depth = 0;
     for sample in &v.samples {
@@ -186,318 +124,254 @@ fn setup(
 	}
     }
 
+    let sample_scale = 0.001;
     let row_height = 20.0;
     let brick_height = 18.0;
 
-    // TODO: rename to program start / finish
-    let first_samp: usize = v.samples[0].timestamp;
-    let last_samp: usize = v.samples.last().unwrap().timestamp;
-
-    let sample_width: f32 = X_EXTENT*2.0 / (last_samp - first_samp) as f32;
-
-    let mut cur_sample: Option<String> = None;
-
+    let mut cur_sample: Option<Vec<CallFrame>> = None;
+    let mut cur_sample_weight: usize = 0;
     let mut cur_sample_start: usize = 0;
-    let mut cur_sample_end: usize = 0;
 
-    for depth in 1..=max_depth {
-        for sample in &v.samples {
+    for depth in 1..=max_depth { // max_depth
+        for (sample_index, sample) in v.samples.iter().enumerate() {
             if sample.pid == pid && sample.tid == tid {
                 if sample.callchain.len() >= depth {
                     match sample.callchain.get(sample.callchain.len() - depth) {
                         Some(frame) => {
+                            let sample_stack: Vec<String> = sample.callchain[(sample.callchain.len() - depth)..=(sample.callchain.len() - 1)].iter().map(|cc| cc.ip.clone()).collect();
                             match &cur_sample {
                                 Some(cs) => {
-                                    if *cs == frame.ip {
-                                        // continue
-                                        cur_sample_end = sample.timestamp;
+                                    let cur_cc: Vec<String> = cs.iter().map(|cc| cc.ip.clone()).collect();
+                                    if sample_stack == cur_cc {
+                                        // join samples
+                                        // if sample_start[sample_index] > (cur_sample_start + cur_sample_weight / 2) {
+
+                                        // }
+                                        cur_sample_weight += sample_start[sample_index] - (cur_sample_start + cur_sample_weight);
+                                        cur_sample_weight += sample_weight[sample_index];
                                     } else {
-                                        // new frame type sample
-                                        // cur_sample_start = sample.timestamp;
-                                        // cur_sample_end = sample.timestamp; // TODO: is this wrong?
-                                        let mut width = cur_sample_end - cur_sample_start;
-                                        if cur_sample_end - cur_sample_start < 1 {
-                                            width = 10000;
-                                        }
+                                        // new sample
+                                        // TODO: build truescale here first and use it like when resizing
+                                        let x = cur_sample_start;
+                                        let width = cur_sample_weight;
+                                        let text = cs[0].symbol.clone().unwrap_or(cs[0].ip.clone());
+                                        // let rect = Rectangle::new(width as f32 * sample_scale, brick_height);
+                                        let rect = Rectangle::default();
+                                        let rect_mesh = meshes.add(rect);
+                                        let color = Color::hsl((x + depth % 360) as f32, 0.33, 0.44);
+                                        let mut transform = Transform::from_xyz(
+                                            -X_EXTENT + (x + width/2) as f32 * sample_scale,
+                                            -Y_EXTENT + depth as f32 * row_height,
+                                            0.0,
+                                        );
+                                        transform.scale = Vec3::new(width as f32 * sample_scale, brick_height, 1.0);
 
-                                        // middle origin point
-                                        let x = (cur_sample_start - first_samp) + width / 2;
-                                        let y = depth;
-
-                                        let rect_mesh = meshes.add(Rectangle::new(width as f32 * sample_width, 18.0));
-                                        let color = Color::hsl((x % 360) as f32, (y % 360) as f32, (x+y % 360) as f32);
                                         commands.spawn((
                                             Mesh2d(rect_mesh),
                                             MeshMaterial2d(materials.add(color)),
-                                            Transform::from_xyz(
-                                                -X_EXTENT + x as f32 * sample_width,
-                                                -Y_EXTENT + y as f32 * row_height,
-                                                0.0,
-                                            ),
-                                        ));
-                                        // sample switch
-                                        cur_sample = Some(frame.ip.clone());
-                                        cur_sample_start = sample.timestamp;
-                                        cur_sample_end = sample.timestamp;
+                                            transform,
+                                            TrueScale { x: x, width: width, scale: sample_scale },
+                                            HoverText(cs[0].clone()),
+                                            // children![Text2d::new(text)],
+                                        ))
+                                            .observe(spawn_tooltip)
+                                            .observe(despawn_tooltip);
+
+                                        // sample start
+                                        let scc: Vec<CallFrame> = sample.callchain[(sample.callchain.len() - depth)..=(sample.callchain.len() - 1)].into();
+                                        cur_sample = Some(scc);
+                                        cur_sample_start = sample_start[sample_index];
+                                        cur_sample_weight = sample_weight[sample_index];
                                     }
                                 }
                                 None => {
                                     // sample start
-                                    cur_sample = Some(frame.ip.clone());
-                                    cur_sample_start = sample.timestamp;
-                                    cur_sample_end = sample.timestamp;
+                                    let scc: Vec<CallFrame> = sample.callchain[(sample.callchain.len() - depth)..=(sample.callchain.len() - 1)].into();
+                                    cur_sample = Some(scc);
+                                    cur_sample_start = sample_start[sample_index];
+                                    cur_sample_weight = sample_weight[sample_index];
                                 }
                             }
-                        }
-                        None => {
-                            // no frame found at this depth
-                            match &cur_sample {
-                                Some(cs) => {
-                                    // sample started, print it and end it.
-                                    // cur_sample_end = sample.timestamp;
-                                    let mut width = cur_sample_end - cur_sample_start;
-                                    if cur_sample_end - cur_sample_start < 1 {
-                                        width = 10000;
-                                    }
-                                    // middle origin point
-                                    let x = cur_sample_start - first_samp + width / 2;
-                                    let y = depth;
 
-                                    let rect_mesh = meshes.add(Rectangle::new(width as f32 * sample_width, 18.0));
-                                    let color = Color::hsl((x % 360) as f32, (y % 360) as f32, (x+y % 360) as f32);
-                                    commands.spawn((
-                                        Mesh2d(rect_mesh),
-                                        MeshMaterial2d(materials.add(color)),
-                                        Transform::from_xyz(
-                                            -X_EXTENT + x as f32 * sample_width,
-                                            -Y_EXTENT + y as f32 * row_height,
-                                            0.0,
-                                        ),
-                                    ));
-                                    cur_sample = None;
-                                }
-                                None => {
-                                    // TODO: unneeded
-                                }
-                            }
+
                         }
+                        None => {},
+                    }
+                }  else {
+                    match &cur_sample {
+                        Some(cs) => {
+                            let x = cur_sample_start;
+                            let width = cur_sample_weight;
+                            let text = cs[0].symbol.clone().unwrap_or(cs[0].ip.clone());
+                            // let rect = Rectangle::new(width as f32 * sample_scale, brick_height);
+                            let rect = Rectangle::default();
+                            let rect_mesh = meshes.add(rect);
+                            let color = Color::hsl((x + depth % 360) as f32, 0.33, 0.44);
+                            let mut transform = Transform::from_xyz(
+                                -X_EXTENT + (x + width/2) as f32 * sample_scale,
+                                -Y_EXTENT + depth as f32 * row_height,
+                                0.0,
+                            );
+                            transform.scale = Vec3::new(width as f32 * sample_scale, brick_height, 1.0);
+
+                            commands.spawn((
+                                Mesh2d(rect_mesh),
+                                MeshMaterial2d(materials.add(color)),
+                                transform,
+                                TrueScale { x: x, width: width, scale: sample_scale },
+                                HoverText(cs[0].clone()),
+                                // children![Text2d::new(text)],
+                            ))
+                                .observe(spawn_tooltip)
+                                .observe(despawn_tooltip);
+
+                            cur_sample = None;
+                            cur_sample_start = 0;
+                            cur_sample_weight = 0;
+                        }
+                        None => {},
                     }
                 }
-            } else {
-                // match &cur_sample {
-                //     Some(cs) => {
-                //         cur_sample_end = sample.timestamp;
-                //         // new thread started, print it and end it.
-                //         let width = cur_sample_end - cur_sample_start;
-                //         // middle origin point
-                //         let x = cur_sample_start - first_samp + width / 2;
-                //         let y = depth;
-
-                //         let rect_mesh = meshes.add(Rectangle::new(width as f32 * sample_width, 18.0));
-                //         let color = Color::hsl((x % 360) as f32, (y % 360) as f32, (x+y % 360) as f32);
-                //         commands.spawn((
-                //             Mesh2d(rect_mesh),
-                //             MeshMaterial2d(materials.add(color)),
-                //             Transform::from_xyz(
-                //                 -X_EXTENT + x as f32 * sample_width,
-                //                 -Y_EXTENT + y as f32 * row_height,
-                //                 0.0,
-                //             ),
-                //         ));
-                //         cur_sample = None;
-                //     }
-                //     None => {}
-                // }
             }
-
         }
-        // last sample if one is running
         match &cur_sample {
             Some(cs) => {
-                // cur_sample_end = last_samp;
+                let x = cur_sample_start;
+                let width = cur_sample_weight;
+                let text = cs[0].symbol.clone().unwrap_or(cs[0].ip.clone());
+                // let rect = Rectangle::new(width as f32 * sample_scale, brick_height);
+                let rect = Rectangle::default();
+                let rect_mesh = meshes.add(rect);
+                let color = Color::hsl((x + depth % 360) as f32, 0.33, 0.44);
+                let mut transform = Transform::from_xyz(
+                    -X_EXTENT + (x + width/2) as f32 * sample_scale,
+                    -Y_EXTENT + depth as f32 * row_height,
+                    0.0,
+                );
+                transform.scale = Vec3::new(width as f32 * sample_scale, brick_height, 1.0);
 
-                let width = cur_sample_end - cur_sample_start;
-                let x = cur_sample_start - first_samp + width / 2;
-                let y = depth;
-
-                let rect_mesh = meshes.add(Rectangle::new(width as f32 * sample_width, 18.0));
-                let color = Color::hsl((x % 360) as f32, (y % 360) as f32, (x+y % 360) as f32);
                 commands.spawn((
                     Mesh2d(rect_mesh),
                     MeshMaterial2d(materials.add(color)),
-                    Transform::from_xyz(
-                        -X_EXTENT + x as f32 * sample_width,
-                        -Y_EXTENT + y as f32 * row_height,
-                        0.0,
-                    ),
-                ));
+                    transform,
+                    TrueScale { x: x, width: width, scale: sample_scale },
+                    HoverText(cs[0].clone()),
+                    // children![Text2d::new(text)],
+                ))
+                    .observe(spawn_tooltip)
+                    .observe(despawn_tooltip);
                 cur_sample = None;
+                cur_sample_start = 0;
+                cur_sample_weight = 0;
             }
-            None => {
-                // TODO: unneeded
-            }
+            None => {},
         }
+    }
+}
 
+fn spawn_tooltip(
+    over: On<Pointer<Over>>,
+    hover_texts: Query<&HoverText>,
+    mut commands: Commands,
+) {
+    if let Ok(hover_text) = hover_texts.get(over.entity) {
+        if let Some(position) = over.hit.position {
+            let text = format!("ip = {} symbol = {:?}", hover_text.0.ip, hover_text.0.symbol);
+            // Spawn the tooltip as a child of the hovered entity
+            commands.spawn((
+                Text2d::new(text),
+                Tooltip,
+                Transform::from_xyz(
+                    0.0 + position.x,
+                    30.0 + position.y,
+                    0.0,
+                ),
+            ));
+        }
+    }
+}
+
+fn despawn_tooltip(
+    out: On<Pointer<Out>>,
+    tooltips: Query<Entity, With<Tooltip>>,
+    mut commands: Commands,
+) {
+    // Despawn any tooltip attached to this entity
+    for entity in tooltips.iter() {
+        commands.entity(entity).despawn();
+    }
+}
+
+fn move_camera(
+    keyboard_input: Res<ButtonInput<KeyCode>>,
+    mut query: Query<(&mut Transform, &mut Projection), With<Camera2d>>,
+    time: Res<Time>,
+) {
+    let Ok((mut transform, mut projection)) = query.single_mut() else { todo!() };
+    let mut direction = Vec2::ZERO;
+
+    if keyboard_input.pressed(KeyCode::ArrowUp) {
+        // direction.y += 1.0;
+    }
+    if keyboard_input.pressed(KeyCode::ArrowDown) {
+        // direction.y -= 1.0;
+    }
+    if keyboard_input.pressed(KeyCode::ArrowLeft) {
+        direction.x -= 1.0;
+    }
+    if keyboard_input.pressed(KeyCode::ArrowRight) {
+        direction.x += 1.0;
     }
 
-    // for depth in 1..=2 { // max_depth
-    //     for sample in &v.samples {
-    //         if sample.pid == pid && sample.tid == tid {
-    //             if sample.callchain.len() >= depth {
-    //                 match sample.callchain.get(sample.callchain.len() - depth) {
-    //                     Some(frame) => {
-    //                         println!("frame {:?} at {}", frame, depth);
-    //                         match &cur_sample {
-    //                             Some(cs) => {
-    //                                 if *cs == frame.ip {
-    //                                     println!("CONTINUE");
-    //                                     cur_sample_end = sample.timestamp;
-    //                                 } else {
-    //                                     cur_sample = Some(frame.ip.clone());
-    //                                     cur_sample_start = sample.timestamp;
-    //                                     cur_sample_end = sample.timestamp;
+    let speed = 1200.0;
+    transform.translation += direction.extend(0.0) * speed * time.delta_secs();
 
-    //                                     let rect_mesh = if ((cur_sample_end - cur_sample_start) as f32) < 1.0 {
-    //                                         // min sample width
-    //                                         meshes.add(Rectangle::new(1.0 * sample_width, brick_height))
-    //                                     } else {
-    //                                         println!("NON MIN SiZE 1");
-    //                                         meshes.add(Rectangle::new((cur_sample_end - cur_sample_start) as f32 * sample_width, brick_height))
-    //                                     };
-    //                                     let color = Color::hsl(0.22, 0.91, 0.7);
-    //                                     commands.spawn((
-    //                                         Mesh2d(rect_mesh),
-    //                                         MeshMaterial2d(materials.add(color)),
-    //                                         Transform::from_xyz(
-    //                                             (-X_EXTENT + 100.0) + (cur_sample_start - first_samp) as f32 * sample_width,
-    //                                             0.0 + depth as f32 * row_height,
-    //                                             0.0,
-    //                                         ),
-    //                                     ));
-    //                                 }
-    //                             }
-    //                             None => {
-    //                                 println!("start set {}", sample.timestamp as f64);
-    //                                 cur_sample = Some(frame.ip.clone());
-    //                                 cur_sample_start = sample.timestamp;
-    //                                 cur_sample_end = sample.timestamp;
-    //                             }
-    //                         }
-    //                     }
-    //                     None => {
-    //                         match cur_sample {
-    //                             Some(cs) => {
-    //                                 let rect_mesh = if ((cur_sample_end - cur_sample_start) as f32) < 1.0 {
-    //                                     // min sample width
-    //                                     meshes.add(Rectangle::new(1.0 * sample_width, brick_height))
-    //                                 } else {
-    //                                     println!("NON MIN SiZE 2");
-    //                                     meshes.add(Rectangle::new((cur_sample_end - cur_sample_start) as f32 * sample_width, brick_height))
-    //                                 };
-    //                                 let color = Color::hsl(0.22, 0.75, 0.92);
+    let zoom_speed = 2.0;
 
-    //                                 println!("x2 = {}", (cur_sample_start - first_samp) as f32 * sample_width);
-    //                                 println!("y2 = {}", Y_EXTENT - depth as f32);
-    //                                 commands.spawn((
-    //                                     Mesh2d(rect_mesh),
-    //                                     MeshMaterial2d(materials.add(color)),
-    //                                     Transform::from_xyz(
-    //                                         -X_EXTENT + (cur_sample_start - first_samp) as f32 * sample_width,
-    //                                         0.0 + depth as f32 * row_height,
-    //                                         0.0,
-    //                                     ),
-    //                                 ));
-    //                                 println!("cur sample reset 2");
-    //                                 cur_sample = None;
-    //                             }
-    //                             None => {
-    //                                 // println!("cur sample reset 3");
-    //                                 // cur_sample = None
-    //                             }
-    //                         }
-    //                     }
-    //                 }
-    //             } else {
-    //                 match cur_sample {
-    //                     Some(cs) => {
-    //                         let rect_mesh = if ((cur_sample_end - cur_sample_start) as f32) < 1.0 {
-    //                             // min sample width
-    //                             meshes.add(Rectangle::new(1.0 * sample_width, brick_height))
-    //                         } else {
-    //                             println!("NON MIN SiZE 2");
-    //                             meshes.add(Rectangle::new((cur_sample_end - cur_sample_start) as f32 * sample_width, brick_height))
-    //                         };
-    //                         let color = Color::hsl(0.22, 0.95, 0.45);
-
-    //                         println!("x2 = {}", (cur_sample_start - first_samp) as f32 * sample_width);
-    //                         println!("y2 = {}", Y_EXTENT - depth as f32);
-    //                         commands.spawn((
-    //                             Mesh2d(rect_mesh),
-    //                             MeshMaterial2d(materials.add(color)),
-    //                             Transform::from_xyz(
-    //                                 -X_EXTENT + (cur_sample_start - first_samp) as f32 * sample_width,
-    //                                 0.0 + depth as f32 * row_height,
-    //                                 0.0,
-    //                             ),
-    //                         ));
-    //                         println!("cur sample reset 2");
-    //                         cur_sample = None;
-    //                     }
-    //                     None => {
-    //                         // println!("cur sample reset 3");
-    //                         // cur_sample = None
-    //                     }
-    //                 }
-    //                 cur_sample = None;
-    //             }
-    //         }
+    // if let Projection::Orthographic(projection2d) = &mut *projection {
+    //     // Zoom Out (Increase scale to see more)
+    //     if keyboard_input.pressed(KeyCode::KeyZ) {
+    //         projection2d.scale += zoom_speed * time.delta_secs();
     //     }
-    //     match cur_sample {
-    //         Some(cs) => {
-    //             let rect_mesh = if ((cur_sample_end - cur_sample_start) as f32) < 1.0 {
-    //                 // min sample width
-    //                 meshes.add(Rectangle::new(1.0 * sample_width, brick_height))
-    //             } else {
-    //                 println!("NON MIN SiZE 2");
-    //                 meshes.add(Rectangle::new((cur_sample_end - cur_sample_start) as f32 * sample_width, brick_height))
-    //             };
 
-    //             let color = Color::hsl(0.22, 0.34, 0.7);
-
-    //             println!("x2 = {}", (cur_sample_start - first_samp) as f32 * sample_width);
-    //             println!("y2 = {}", Y_EXTENT - depth as f32);
-    //             commands.spawn((
-    //                 Mesh2d(rect_mesh),
-    //                 MeshMaterial2d(materials.add(color)),
-    //                 Transform::from_xyz(
-    //                     -X_EXTENT + (cur_sample_start - first_samp) as f32 * sample_width,
-    //                     0.0 + depth as f32 * row_height,
-    //                     0.0,
-    //                 ),
-    //             ));
-    //             println!("cur sample reset 2");
-    //             cur_sample = None;
-    //         }
-    //         None => {
-    //             // println!("cur sample reset 3");
-    //             // cur_sample = None
-    //         }
+    //     // Zoom In (Decrease scale to see less)
+    //     if keyboard_input.pressed(KeyCode::KeyX) {
+    //         projection2d.scale -= zoom_speed * time.delta_secs();
     //     }
-    //     cur_sample = None
+    //     projection2d.scale = projection2d.scale.clamp(0.1, 10.0);
     // }
 }
 
+fn zoom_samples(
+    keyboard_input: Res<ButtonInput<KeyCode>>,
+    mut query: Query<(&mut Transform, &mut TrueScale)>,
+    time: Res<Time>,
+) {
 
+    if keyboard_input.pressed(KeyCode::KeyZ) {
+        for mut sample in &mut query {
+            sample.1.scale -= 0.001 * time.delta_secs();
+            sample.0.translation.x = -X_EXTENT + (sample.1.x + sample.1.width/2) as f32 * sample.1.scale;
+            sample.0.scale.x = sample.1.width as f32 * sample.1.scale;
+        }
+    }
+
+    if keyboard_input.pressed(KeyCode::KeyX) {
+        for mut sample in &mut query {
+            sample.1.scale += 0.001 * time.delta_secs();
+            sample.0.translation.x = -X_EXTENT + (sample.1.x + sample.1.width/2) as f32 * sample.1.scale;
+            sample.0.scale.x = sample.1.width as f32 * sample.1.scale;
+        }
+    }
+}
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let input = fs::read_to_string("perf.json")?;
     let v: PerfData = serde_json::from_str(&input)?;
     let version_str = format!("version: {}", v.linux_perf_json_version);
     // to_graph(v.samples);
-    to_flamegraph(v.samples);
+    // to_flamegraph(v.samples);
     // println!("{}",version_str);
-
-
 
     App::new()
         .add_plugins(DefaultPlugins.set(WindowPlugin {
@@ -507,7 +381,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }),
             ..default()
         }))
-        .add_systems(Startup, setup).run();
+        .add_plugins(MeshPickingPlugin)
+        .add_systems(Startup, setup)
+        .add_systems(Update, (move_camera, zoom_samples)).run();
+
 
     return Ok(());
 }
