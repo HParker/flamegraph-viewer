@@ -1,7 +1,5 @@
 use serde::{Deserialize, Serialize};
-// use serde_json::{Value};
 use std::fs;
-use std::collections::HashMap;
 use bevy::{prelude::*, window::WindowResolution};
 
 #[derive(Serialize, Deserialize)]
@@ -47,20 +45,6 @@ struct PerfSample {
     callchain: Vec<CallFrame>
 }
 
-#[derive(Debug)]
-struct FGraph {
-    total_samples: usize,
-    self_samples: usize,
-    ip: String,
-    symbol: Option<String>,
-    dso: Option<String>
-}
-
-// struct Flamegraph {
-//     // metadata,
-//     graph: HashMap<(usize, usize), HashMap<String, FGraph>>,
-// }
-
 #[derive(Component)]
 struct HoverText(CallFrame);
 
@@ -77,194 +61,151 @@ struct TrueScale {
 const X_EXTENT: f32 = 1600.;
 const Y_EXTENT: f32 = 900.;
 
+const SAMPLE_SCALE: f32 = 0.001;
+const ROW_HEIGHT: f32 = 20.0;
+const BRICK_HEIGHT: f32 = 18.0;
+
+const TARGET_PID: usize = 64477;
+const TARGET_TID: usize = 64477;
+
+/// The deepest `depth` frames of a callchain (innermost frames), or `None`
+/// when the callchain is shallower than `depth`.
+fn frames_at_depth(callchain: &[CallFrame], depth: usize) -> Option<&[CallFrame]> {
+    if callchain.len() >= depth {
+        Some(&callchain[callchain.len() - depth..])
+    } else {
+        None
+    }
+}
+
+/// Two stacks form the same brick when their frames share the same instruction
+/// pointers in order.
+fn frames_match(a: &[CallFrame], b: &[CallFrame]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.ip == y.ip)
+}
+
+/// Spawn a single flamegraph brick for `frame` at the given row (`depth`),
+/// horizontal offset (`x`) and `width`.
+fn spawn_brick(
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<ColorMaterial>,
+    frame: &CallFrame,
+    x: usize,
+    width: usize,
+    depth: usize,
+) {
+    let rect_mesh = meshes.add(Rectangle::default());
+    let color = Color::hsl((x + depth % 360) as f32, 0.33, 0.44);
+
+    let mut transform = Transform::from_xyz(
+        -X_EXTENT + (x + width / 2) as f32 * SAMPLE_SCALE,
+        -Y_EXTENT + depth as f32 * ROW_HEIGHT,
+        0.0,
+    );
+    transform.scale = Vec3::new(width as f32 * SAMPLE_SCALE, BRICK_HEIGHT, 1.0);
+
+    commands
+        .spawn((
+            Mesh2d(rect_mesh),
+            MeshMaterial2d(materials.add(color)),
+            transform,
+            TrueScale { x, width, scale: SAMPLE_SCALE },
+            HoverText(frame.clone()),
+        ))
+        .observe(spawn_tooltip)
+        .observe(despawn_tooltip);
+}
+
 fn setup(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<ColorMaterial>>,
 ) {
-    // commands.spawn(Camera2d);
     commands.spawn(Camera2d::default());
 
     let input = fs::read_to_string("perf.json").unwrap();
-    let v: PerfData = serde_json::from_str(&input).unwrap();
+    let perf: PerfData = serde_json::from_str(&input).unwrap();
+    let samples = &perf.samples;
+    let sample_len = samples.len();
 
-    let pid = 64477;
-    let tid = 64477;
-
-    // TODO: assert more than 3 samples
-    let sample_len = v.samples.len();
-
-    let first_samp: usize = v.samples[0].timestamp;
-    let last_samp: usize = v.samples.last().unwrap().timestamp;
-
-    let mut sample_weight: Vec<usize> = vec![];
-    // sample_weight.push(v.samples[1].timestamp - v.samples[0].timestamp);
-    for window in v.samples.windows(2) {
-        let before = window[0].timestamp;
-        let after = window[1].timestamp;
-        let weight = after - before;
-        sample_weight.push(weight);
+    // Weight of each sample is the time until the following sample; the last
+    // sample reuses the previous gap.
+    let mut sample_weight: Vec<usize> = Vec::with_capacity(sample_len);
+    for window in samples.windows(2) {
+        sample_weight.push(window[1].timestamp - window[0].timestamp);
     }
-    // sample_weight.push((v.samples[sample_len - 1].timestamp - v.samples[sample_len - 2].timestamp) / 2);
-    sample_weight.push(v.samples[sample_len - 1].timestamp - v.samples[sample_len - 2].timestamp);
+    sample_weight.push(samples[sample_len - 1].timestamp - samples[sample_len - 2].timestamp);
 
-    // sample start
-    let mut sample_start: Vec<usize> = vec![];
-    let mut debug_width = 0;
-    for sample in v.samples.iter() {
-        sample_start.push(sample.timestamp - first_samp);
-    }
+    // Start offset of each sample relative to the first sample.
+    let first_samp = samples[0].timestamp;
+    let sample_start: Vec<usize> =
+        samples.iter().map(|s| s.timestamp - first_samp).collect();
 
-    let mut max_depth = 0;
-    for sample in &v.samples {
-	if sample.pid == pid && sample.tid == tid {
-            if sample.callchain.len() > max_depth {
-                max_depth = sample.callchain.len();
+    let max_depth = samples
+        .iter()
+        .filter(|s| s.pid == TARGET_PID && s.tid == TARGET_TID)
+        .map(|s| s.callchain.len())
+        .max()
+        .unwrap_or(0);
+
+    // Build one row of bricks per stack depth. Within a row, consecutive
+    // samples sharing the same stack are merged into a single wide brick.
+    for depth in 1..=max_depth {
+        let mut cur_frames: Option<Vec<CallFrame>> = None;
+        let mut cur_start: usize = 0;
+        let mut cur_weight: usize = 0;
+
+        for (sample_index, sample) in samples.iter().enumerate() {
+            if sample.pid != TARGET_PID || sample.tid != TARGET_TID {
+                continue;
             }
-	}
-    }
 
-    let sample_scale = 0.001;
-    let row_height = 20.0;
-    let brick_height = 18.0;
-
-    let mut cur_sample: Option<Vec<CallFrame>> = None;
-    let mut cur_sample_weight: usize = 0;
-    let mut cur_sample_start: usize = 0;
-
-    for depth in 1..=max_depth { // max_depth
-        for (sample_index, sample) in v.samples.iter().enumerate() {
-            if sample.pid == pid && sample.tid == tid {
-                if sample.callchain.len() >= depth {
-                    match sample.callchain.get(sample.callchain.len() - depth) {
-                        Some(frame) => {
-                            let sample_stack: Vec<String> = sample.callchain[(sample.callchain.len() - depth)..=(sample.callchain.len() - 1)].iter().map(|cc| cc.ip.clone()).collect();
-                            match &cur_sample {
-                                Some(cs) => {
-                                    let cur_cc: Vec<String> = cs.iter().map(|cc| cc.ip.clone()).collect();
-                                    if sample_stack == cur_cc {
-                                        // join samples
-                                        // if sample_start[sample_index] > (cur_sample_start + cur_sample_weight / 2) {
-
-                                        // }
-                                        cur_sample_weight += sample_start[sample_index] - (cur_sample_start + cur_sample_weight);
-                                        cur_sample_weight += sample_weight[sample_index];
-                                    } else {
-                                        // new sample
-                                        // TODO: build truescale here first and use it like when resizing
-                                        let x = cur_sample_start;
-                                        let width = cur_sample_weight;
-                                        let text = cs[0].symbol.clone().unwrap_or(cs[0].ip.clone());
-                                        // let rect = Rectangle::new(width as f32 * sample_scale, brick_height);
-                                        let rect = Rectangle::default();
-                                        let rect_mesh = meshes.add(rect);
-                                        let color = Color::hsl((x + depth % 360) as f32, 0.33, 0.44);
-                                        let mut transform = Transform::from_xyz(
-                                            -X_EXTENT + (x + width/2) as f32 * sample_scale,
-                                            -Y_EXTENT + depth as f32 * row_height,
-                                            0.0,
-                                        );
-                                        transform.scale = Vec3::new(width as f32 * sample_scale, brick_height, 1.0);
-
-                                        commands.spawn((
-                                            Mesh2d(rect_mesh),
-                                            MeshMaterial2d(materials.add(color)),
-                                            transform,
-                                            TrueScale { x: x, width: width, scale: sample_scale },
-                                            HoverText(cs[0].clone()),
-                                            // children![Text2d::new(text)],
-                                        ))
-                                            .observe(spawn_tooltip)
-                                            .observe(despawn_tooltip);
-
-                                        // sample start
-                                        let scc: Vec<CallFrame> = sample.callchain[(sample.callchain.len() - depth)..=(sample.callchain.len() - 1)].into();
-                                        cur_sample = Some(scc);
-                                        cur_sample_start = sample_start[sample_index];
-                                        cur_sample_weight = sample_weight[sample_index];
-                                    }
-                                }
-                                None => {
-                                    // sample start
-                                    let scc: Vec<CallFrame> = sample.callchain[(sample.callchain.len() - depth)..=(sample.callchain.len() - 1)].into();
-                                    cur_sample = Some(scc);
-                                    cur_sample_start = sample_start[sample_index];
-                                    cur_sample_weight = sample_weight[sample_index];
-                                }
-                            }
-
-
-                        }
-                        None => {},
+            match frames_at_depth(&sample.callchain, depth) {
+                Some(frames) => match &cur_frames {
+                    // Same stack: extend the current brick to cover this sample.
+                    Some(cur) if frames_match(cur, frames) => {
+                        cur_weight += sample_start[sample_index] - (cur_start + cur_weight);
+                        cur_weight += sample_weight[sample_index];
                     }
-                }  else {
-                    match &cur_sample {
-                        Some(cs) => {
-                            let x = cur_sample_start;
-                            let width = cur_sample_weight;
-                            let text = cs[0].symbol.clone().unwrap_or(cs[0].ip.clone());
-                            // let rect = Rectangle::new(width as f32 * sample_scale, brick_height);
-                            let rect = Rectangle::default();
-                            let rect_mesh = meshes.add(rect);
-                            let color = Color::hsl((x + depth % 360) as f32, 0.33, 0.44);
-                            let mut transform = Transform::from_xyz(
-                                -X_EXTENT + (x + width/2) as f32 * sample_scale,
-                                -Y_EXTENT + depth as f32 * row_height,
-                                0.0,
-                            );
-                            transform.scale = Vec3::new(width as f32 * sample_scale, brick_height, 1.0);
-
-                            commands.spawn((
-                                Mesh2d(rect_mesh),
-                                MeshMaterial2d(materials.add(color)),
-                                transform,
-                                TrueScale { x: x, width: width, scale: sample_scale },
-                                HoverText(cs[0].clone()),
-                                // children![Text2d::new(text)],
-                            ))
-                                .observe(spawn_tooltip)
-                                .observe(despawn_tooltip);
-
-                            cur_sample = None;
-                            cur_sample_start = 0;
-                            cur_sample_weight = 0;
-                        }
-                        None => {},
+                    // Different stack: flush the current brick, start a new one.
+                    Some(cur) => {
+                        spawn_brick(
+                            &mut commands, &mut meshes, &mut materials,
+                            &cur[0], cur_start, cur_weight, depth,
+                        );
+                        cur_frames = Some(frames.to_vec());
+                        cur_start = sample_start[sample_index];
+                        cur_weight = sample_weight[sample_index];
+                    }
+                    // No brick in progress: start one.
+                    None => {
+                        cur_frames = Some(frames.to_vec());
+                        cur_start = sample_start[sample_index];
+                        cur_weight = sample_weight[sample_index];
+                    }
+                },
+                // Sample is shallower than this row: flush any brick in progress.
+                None => {
+                    if let Some(cur) = &cur_frames {
+                        spawn_brick(
+                            &mut commands, &mut meshes, &mut materials,
+                            &cur[0], cur_start, cur_weight, depth,
+                        );
+                        cur_frames = None;
+                        cur_start = 0;
+                        cur_weight = 0;
                     }
                 }
             }
         }
-        match &cur_sample {
-            Some(cs) => {
-                let x = cur_sample_start;
-                let width = cur_sample_weight;
-                let text = cs[0].symbol.clone().unwrap_or(cs[0].ip.clone());
-                // let rect = Rectangle::new(width as f32 * sample_scale, brick_height);
-                let rect = Rectangle::default();
-                let rect_mesh = meshes.add(rect);
-                let color = Color::hsl((x + depth % 360) as f32, 0.33, 0.44);
-                let mut transform = Transform::from_xyz(
-                    -X_EXTENT + (x + width/2) as f32 * sample_scale,
-                    -Y_EXTENT + depth as f32 * row_height,
-                    0.0,
-                );
-                transform.scale = Vec3::new(width as f32 * sample_scale, brick_height, 1.0);
 
-                commands.spawn((
-                    Mesh2d(rect_mesh),
-                    MeshMaterial2d(materials.add(color)),
-                    transform,
-                    TrueScale { x: x, width: width, scale: sample_scale },
-                    HoverText(cs[0].clone()),
-                    // children![Text2d::new(text)],
-                ))
-                    .observe(spawn_tooltip)
-                    .observe(despawn_tooltip);
-                cur_sample = None;
-                cur_sample_start = 0;
-                cur_sample_weight = 0;
-            }
-            None => {},
+        // Flush the final brick of the row.
+        if let Some(cur) = &cur_frames {
+            spawn_brick(
+                &mut commands, &mut meshes, &mut materials,
+                &cur[0], cur_start, cur_weight, depth,
+            );
         }
     }
 }
@@ -277,26 +218,20 @@ fn spawn_tooltip(
     if let Ok(hover_text) = hover_texts.get(over.entity) {
         if let Some(position) = over.hit.position {
             let text = format!("ip = {} symbol = {:?}", hover_text.0.ip, hover_text.0.symbol);
-            // Spawn the tooltip as a child of the hovered entity
             commands.spawn((
                 Text2d::new(text),
                 Tooltip,
-                Transform::from_xyz(
-                    0.0 + position.x,
-                    30.0 + position.y,
-                    0.0,
-                ),
+                Transform::from_xyz(position.x, 30.0 + position.y, 0.0),
             ));
         }
     }
 }
 
 fn despawn_tooltip(
-    out: On<Pointer<Out>>,
+    _out: On<Pointer<Out>>,
     tooltips: Query<Entity, With<Tooltip>>,
     mut commands: Commands,
 ) {
-    // Despawn any tooltip attached to this entity
     for entity in tooltips.iter() {
         commands.entity(entity).despawn();
     }
@@ -304,18 +239,14 @@ fn despawn_tooltip(
 
 fn move_camera(
     keyboard_input: Res<ButtonInput<KeyCode>>,
-    mut query: Query<(&mut Transform, &mut Projection), With<Camera2d>>,
+    mut query: Query<&mut Transform, With<Camera2d>>,
     time: Res<Time>,
 ) {
-    let Ok((mut transform, mut projection)) = query.single_mut() else { todo!() };
-    let mut direction = Vec2::ZERO;
+    let Ok(mut transform) = query.single_mut() else {
+        return;
+    };
 
-    if keyboard_input.pressed(KeyCode::ArrowUp) {
-        // direction.y += 1.0;
-    }
-    if keyboard_input.pressed(KeyCode::ArrowDown) {
-        // direction.y -= 1.0;
-    }
+    let mut direction = Vec2::ZERO;
     if keyboard_input.pressed(KeyCode::ArrowLeft) {
         direction.x -= 1.0;
     }
@@ -325,21 +256,6 @@ fn move_camera(
 
     let speed = 1200.0;
     transform.translation += direction.extend(0.0) * speed * time.delta_secs();
-
-    let zoom_speed = 2.0;
-
-    // if let Projection::Orthographic(projection2d) = &mut *projection {
-    //     // Zoom Out (Increase scale to see more)
-    //     if keyboard_input.pressed(KeyCode::KeyZ) {
-    //         projection2d.scale += zoom_speed * time.delta_secs();
-    //     }
-
-    //     // Zoom In (Decrease scale to see less)
-    //     if keyboard_input.pressed(KeyCode::KeyX) {
-    //         projection2d.scale -= zoom_speed * time.delta_secs();
-    //     }
-    //     projection2d.scale = projection2d.scale.clamp(0.1, 10.0);
-    // }
 }
 
 fn zoom_samples(
@@ -347,44 +263,33 @@ fn zoom_samples(
     mut query: Query<(&mut Transform, &mut TrueScale)>,
     time: Res<Time>,
 ) {
+    let zoom_delta = if keyboard_input.pressed(KeyCode::KeyZ) {
+        -0.001 * time.delta_secs()
+    } else if keyboard_input.pressed(KeyCode::KeyX) {
+        0.001 * time.delta_secs()
+    } else {
+        return;
+    };
 
-    if keyboard_input.pressed(KeyCode::KeyZ) {
-        for mut sample in &mut query {
-            sample.1.scale -= 0.001 * time.delta_secs();
-            sample.0.translation.x = -X_EXTENT + (sample.1.x + sample.1.width/2) as f32 * sample.1.scale;
-            sample.0.scale.x = sample.1.width as f32 * sample.1.scale;
-        }
-    }
-
-    if keyboard_input.pressed(KeyCode::KeyX) {
-        for mut sample in &mut query {
-            sample.1.scale += 0.001 * time.delta_secs();
-            sample.0.translation.x = -X_EXTENT + (sample.1.x + sample.1.width/2) as f32 * sample.1.scale;
-            sample.0.scale.x = sample.1.width as f32 * sample.1.scale;
-        }
+    for (mut transform, mut scale) in &mut query {
+        scale.scale += zoom_delta;
+        transform.translation.x = -X_EXTENT + (scale.x + scale.width / 2) as f32 * scale.scale;
+        transform.scale.x = scale.width as f32 * scale.scale;
     }
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let input = fs::read_to_string("perf.json")?;
-    let v: PerfData = serde_json::from_str(&input)?;
-    let version_str = format!("version: {}", v.linux_perf_json_version);
-    // to_graph(v.samples);
-    // to_flamegraph(v.samples);
-    // println!("{}",version_str);
-
+fn main() {
     App::new()
         .add_plugins(DefaultPlugins.set(WindowPlugin {
             primary_window: Some(Window {
-                resolution: WindowResolution::new(X_EXTENT as u32 *2.0 as u32, Y_EXTENT as u32 *2.0 as u32).with_scale_factor_override(1.0),
+                resolution: WindowResolution::new(X_EXTENT as u32 * 2, Y_EXTENT as u32 * 2)
+                    .with_scale_factor_override(1.0),
                 ..default()
             }),
             ..default()
         }))
         .add_plugins(MeshPickingPlugin)
         .add_systems(Startup, setup)
-        .add_systems(Update, (move_camera, zoom_samples)).run();
-
-
-    return Ok(());
+        .add_systems(Update, (move_camera, zoom_samples))
+        .run();
 }
