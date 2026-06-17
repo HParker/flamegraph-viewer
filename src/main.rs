@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
-use bevy::{prelude::*, window::WindowResolution};
+use bevy::{prelude::*, sprite::Anchor, window::WindowResolution};
 
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -58,12 +58,29 @@ struct TrueScale {
     scale: f32,
 }
 
+/// Text label drawn on top of a brick. Stores the full (untruncated) text plus
+/// the brick geometry so the label can be repositioned and re-truncated when
+/// the view is zoomed.
+#[derive(Component)]
+struct BrickLabel {
+    full: String,
+    x: usize,
+    width: usize,
+    scale: f32,
+}
+
 const X_EXTENT: f32 = 1600.;
 const Y_EXTENT: f32 = 900.;
 
 const SAMPLE_SCALE: f32 = 0.001;
 const ROW_HEIGHT: f32 = 20.0;
 const BRICK_HEIGHT: f32 = 18.0;
+
+const LABEL_FONT_SIZE: f32 = 12.0;
+// Rough average glyph advance for the default font, used to estimate how many
+// characters fit inside a brick.
+const LABEL_CHAR_WIDTH: f32 = LABEL_FONT_SIZE * 0.5;
+const LABEL_PADDING: f32 = 2.0;
 
 const TARGET_PID: usize = 64477;
 const TARGET_TID: usize = 64477;
@@ -82,6 +99,40 @@ fn frames_at_depth(callchain: &[CallFrame], depth: usize) -> Option<&[CallFrame]
 /// pointers in order.
 fn frames_match(a: &[CallFrame], b: &[CallFrame]) -> bool {
     a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.ip == y.ip)
+}
+
+/// The text shown on a brick: the frame's symbol when present, otherwise its
+/// instruction pointer.
+fn frame_label(frame: &CallFrame) -> String {
+    frame
+        .symbol
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(frame.ip.as_str())
+        .to_string()
+}
+
+/// Truncate `full` so it fits within a brick of the given `width` (in sample
+/// units) at the current `scale`. Returns an empty string when not even one
+/// character fits, and appends ".." when characters are dropped.
+fn fit_label(full: &str, width: usize, scale: f32) -> String {
+    let usable = width as f32 * scale - 2.0 * LABEL_PADDING;
+    let max_chars = (usable / LABEL_CHAR_WIDTH).floor();
+    if max_chars < 1.0 {
+        return String::new();
+    }
+
+    let max_chars = max_chars as usize;
+    if full.chars().count() <= max_chars {
+        return full.to_string();
+    }
+    if max_chars <= 2 {
+        return full.chars().take(max_chars).collect();
+    }
+
+    let mut truncated: String = full.chars().take(max_chars - 2).collect();
+    truncated.push_str("..");
+    truncated
 }
 
 /// Spawn a single flamegraph brick for `frame` at the given row (`depth`),
@@ -115,6 +166,21 @@ fn spawn_brick(
         ))
         .observe(spawn_tooltip)
         .observe(despawn_tooltip);
+
+    // Draw the label as a separate, unscaled entity so it is not stretched by
+    // the brick's transform scale. It is anchored to the brick's left edge.
+    let full = frame_label(frame);
+    commands.spawn((
+        Text2d::new(fit_label(&full, width, SAMPLE_SCALE)),
+        TextFont::from_font_size(LABEL_FONT_SIZE),
+        Anchor::CENTER_LEFT,
+        Transform::from_xyz(
+            -X_EXTENT + x as f32 * SAMPLE_SCALE + LABEL_PADDING,
+            -Y_EXTENT + depth as f32 * ROW_HEIGHT,
+            1.0,
+        ),
+        BrickLabel { full, x, width, scale: SAMPLE_SCALE },
+    ));
 }
 
 fn setup(
@@ -260,8 +326,9 @@ fn move_camera(
 
 fn zoom_samples(
     keyboard_input: Res<ButtonInput<KeyCode>>,
-    mut query: Query<(&mut Transform, &mut TrueScale)>,
     time: Res<Time>,
+    mut bricks: Query<(&mut Transform, &mut TrueScale), Without<BrickLabel>>,
+    mut labels: Query<(&mut Transform, &mut Text2d, &mut BrickLabel), Without<TrueScale>>,
 ) {
     let zoom_delta = if keyboard_input.pressed(KeyCode::KeyZ) {
         -0.001 * time.delta_secs()
@@ -271,10 +338,16 @@ fn zoom_samples(
         return;
     };
 
-    for (mut transform, mut scale) in &mut query {
+    for (mut transform, mut scale) in &mut bricks {
         scale.scale += zoom_delta;
         transform.translation.x = -X_EXTENT + (scale.x + scale.width / 2) as f32 * scale.scale;
         transform.scale.x = scale.width as f32 * scale.scale;
+    }
+
+    for (mut transform, mut text, mut label) in &mut labels {
+        label.scale += zoom_delta;
+        transform.translation.x = -X_EXTENT + label.x as f32 * label.scale + LABEL_PADDING;
+        text.0 = fit_label(&label.full, label.width, label.scale);
     }
 }
 
