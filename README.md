@@ -5,6 +5,29 @@ reads three common profile formats into one in-memory model and lets you explore
 where a program spends its time — either visually (a Bevy GUI) or from the
 command line (LLM- and script-friendly output).
 
+## Screenshots
+
+The GUI opens on a drop target; drag any supported profile onto the window to
+load it:
+
+![The viewer's empty drop target, prompting you to drag a profile file
+onto the window](img/drag-and-drop.png)
+
+Once loaded it shows a **thread overview** — one full-width, time-aligned
+preview per thread (busiest first), so you can see at a glance which threads were
+active when. Pick one with the arrow keys or mouse:
+
+![Thread overview: every thread rendered as a full-width flame-chart preview on a
+shared time axis, the busiest thread selected at the top](img/thread-overview.png)
+
+Opening a thread shows its detailed **time-ordered flame chart**, with a header
+of timing stats and controls. Hover a brick for its self / total time, zoom the
+time and depth axes, and hold `Alt` to reveal per-sample tick lines and
+timestamps:
+
+![Thread detail: a time-ordered flame chart for a single thread, with the call
+stack growing upward and a stats header at the top](img/thread-detail.png)
+
 ## Supported formats
 
 The format is auto-detected from the file contents:
