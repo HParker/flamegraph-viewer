@@ -17,19 +17,17 @@
 //! * `Z` / `X`  – zoom out / in (time axis)
 //! * `C` / `V`  – zoom out / in (depth axis)
 //! * `[` / `]`  – switch to the previous / next thread
+//! * hold `Alt`  – reveal the per-sample tick lines in the flame chart and read
+//!   the timestamp of the tick nearest the cursor
 //! * hover      – highlight the brick under the cursor and every brick that
 //!   shares its symbol / instruction pointer, and show the function's self and
 //!   total time (and event share)
 //!
-//! In the flame chart a faint vertical tick marks the timestamp of each sample.
-//! Hold `Alt` to annotate the tick nearest the cursor with its timestamp. The
-//! chart's left edge is the displayed thread's own first sample, so the header
-//! also reports how far into the profile that thread actually started.
-//!
-//! In the flame chart a faint vertical tick marks the timestamp of each sample.
-//! Hold `Alt` to annotate the tick nearest the cursor with its timestamp. The
-//! chart's left edge is the displayed thread's own first sample, so the header
-//! also reports how far into the profile that thread actually started.
+//! In the flame chart a faint vertical tick can mark each sample's timestamp,
+//! but the ticks are hidden until `Alt` is held (which also annotates the tick
+//! nearest the cursor with its timestamp). The chart's left edge is the
+//! displayed thread's own first sample, so the header also reports how far into
+//! the profile that thread actually started.
 
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
@@ -349,6 +347,7 @@ fn main() {
                 zoom_ticks,
                 resize_top_font,
                 update_hover,
+                toggle_sample_ticks,
                 update_tick_annotation,
                 update_info_panel,
                 update_chrome_visibility,
@@ -588,7 +587,7 @@ fn rebuild_flamegraph(
                 "Thread {}/{}: {}  ({} samples, {} events, depth {})\n\
                  {}\n\
                  view: {}  ·  Tab switch view{}\n\
-                 [ ] thread  ·  arrows pan  ·  Z/X time zoom  ·  C/V depth zoom",
+                 [ ] thread  ·  arrows pan  ·  Z/X time zoom  ·  C/V depth zoom  ·  hold Alt: sample ticks + timestamps",
                 view.cursor + 1,
                 view.order.len(),
                 thread.label(),
@@ -950,6 +949,9 @@ fn spawn_ticks(
             Mesh2d(shared.mesh.clone()),
             MeshMaterial2d(shared.tick.clone()),
             transform,
+            // Hidden by default; shown only while Alt is held (see
+            // `toggle_sample_ticks`), so the chart stays uncluttered.
+            Visibility::Hidden,
             SampleTick {
                 offset_ns: offset,
                 time_ns: sample.timestamp_ns - profile_start,
@@ -1432,6 +1434,24 @@ fn update_hover(
         };
         if material.0 != desired {
             material.0 = desired;
+        }
+    }
+}
+
+/// Sample tick lines are only shown while `Alt` is held — the same modifier that
+/// reveals per-sample timestamps — so the chart stays uncluttered by default.
+fn toggle_sample_ticks(
+    keyboard: Res<ButtonInput<KeyCode>>,
+    mut ticks: Query<&mut Visibility, With<SampleTick>>,
+) {
+    let target = if keyboard.any_pressed([KeyCode::AltLeft, KeyCode::AltRight]) {
+        Visibility::Visible
+    } else {
+        Visibility::Hidden
+    };
+    for mut visibility in &mut ticks {
+        if *visibility != target {
+            *visibility = target;
         }
     }
 }

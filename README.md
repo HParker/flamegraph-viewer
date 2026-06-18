@@ -94,20 +94,21 @@ detail. Drop another file at any time to switch profiles.
 | `[` / `]`    | switch to the previous / next thread                |
 | `Z` / `X`    | zoom the time axis                                  |
 | `C` / `V`    | zoom the depth axis                                 |
-| hover        | highlight the brick and every brick sharing its symbol |
-| click        | show the function's self and total time             |
+| hold `Alt`   | show the per-sample tick lines and read the nearest tick's timestamp |
+| hover        | highlight the brick (and every brick sharing its symbol) and show its self / total time |
 
 Views:
 
 - **Overview** (default) – a grid of every thread's flame graph thumbnail.
   Select one with the arrow keys or mouse and press `Enter` (or click) to open
   it; `Tab` cycles through the detailed views below for that thread.
-- **Flame chart** – samples in time order (left-to-right is wall-clock time). A
-  faint vertical tick marks the timestamp of each sample (hold `Alt` to read the
-  nearest tick's timestamp). The chart's left edge is the displayed thread's
-  *own* first sample, so the header reports how far into the profile that thread
-  actually started — making it obvious when a thread did not begin at the start
-  of the capture.
+- **Flame chart** – samples in time order (left-to-right is wall-clock time).
+  Hold `Alt` to reveal a faint vertical tick at each sample's timestamp and read
+  the nearest tick's timestamp; the ticks are hidden otherwise to keep the chart
+  uncluttered. The chart's left edge is the displayed thread's *own* first
+  sample, so the header reports how far into the profile that thread actually
+  started — making it obvious when a thread did not begin at the start of the
+  capture.
 - **Flame graph** – left-heavy / size-ordered icicle (widest sibling first);
   best for spotting the largest stacks regardless of when they happened.
 - **Top table** – every function with its self and total time, sortable by self
