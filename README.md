@@ -64,24 +64,24 @@ script` output when you need counts that line up with `perf report`.
 
 ## Build and run
 
-Build everything once (the GUI and both CLIs), then pass your profile as the
-first argument. The format is detected automatically, so the same file works
-with every entry point:
+Build everything once (the GUI and both CLIs). The GUI now opens to an empty
+window — **drag a profile file onto it** to load it. The CLIs still take the
+profile as their first argument. The format is detected automatically, so the
+same file works with every entry point:
 
 ```sh
 cargo build --release
 
-./target/release/flamegraph-viewer out.perf     # interactive GUI
-./target/release/flamegraph-viewer perf.json     # JSON works too
+./target/release/flamegraph-viewer              # interactive GUI; drop a file in
 
 ./target/release/hotspots out.perf               # text bottleneck report
-./target/release/validate out.perf               # summary + sanity check
 ```
 
 ## The GUI
 
-Launch with a profile path. It opens on an **overview** of every thread; pick
-one to inspect in detail.
+It opens on a **drop here** prompt; drag a profile file onto the window to load
+it. Once loaded it shows an **overview** of every thread; pick one to inspect in
+detail. Drop another file at any time to switch profiles.
 
 | Key          | Action                                              |
 | ------------ | --------------------------------------------------- |
@@ -153,4 +153,4 @@ total` hold throughout.
 - `src/flame.rs` – layout (`layout`, `left_heavy`) and aggregation
   (`call_tree`, `flat_profile`, `symbol_stats`).
 - `src/main.rs` – the Bevy renderer.
-- `src/bin/hotspots.rs`, `src/bin/validate.rs` – the CLIs.
+- `src/bin/hotspots.rs` – the CLI.

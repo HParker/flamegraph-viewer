@@ -1,10 +1,13 @@
 //! Bevy flamegraph viewer.
 //!
-//! Loads a profile (perf JSON, `perf script` text or Gecko) chosen on the
-//! command line. It opens on an overview of every thread's flame graph; pick one
-//! to inspect in detail as a flame chart, left-heavy flame graph or top table.
+//! Loads a profile (perf JSON, `perf script` text or Gecko) dropped onto the
+//! window. It opens on a "drop a file here" prompt; once a file is dropped it
+//! shows an overview of every thread's flame graph; pick one to inspect in
+//! detail as a flame chart, left-heavy flame graph or top table. Dropping
+//! another file at any time loads it in place.
 //!
 //! Controls:
+//! * drop a file – load (or replace) the profile being viewed
 //! * overview   – arrow keys or click select a thread; `Enter` / click opens it
 //! * `Tab`      – cycle view: overview → flame chart → flame graph → top
 //! * `Esc`      – return to the thread overview
@@ -31,11 +34,10 @@
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
-use std::path::PathBuf;
-use std::process;
 
 use bevy::{
-    prelude::*, sprite::Anchor, window::PrimaryWindow, window::WindowResolution,
+    prelude::*, sprite::Anchor, window::FileDragAndDrop, window::PrimaryWindow,
+    window::WindowResolution,
 };
 
 use flamegraph_viewer::flame::{self, FunctionStat};
@@ -99,11 +101,17 @@ const TOP_FONT_SIZE: f32 = 13.0;
 const MIN_TOP_FONT: f32 = 7.0;
 const MAX_TOP_FONT: f32 = 40.0;
 
+/// Text shown centred on the window while no profile is loaded.
+const DROP_PROMPT: &str =
+    "Drop a profile file here to open it\n\nperf script, perf JSON, or Firefox/Gecko JSON";
+
 const PALETTE_SIZE: usize = 64;
 
 /// The whole parsed profile.
+/// The profile currently being viewed, or `None` before any file is dropped on
+/// the window (the app opens on a "drop a file here" prompt).
 #[derive(Resource)]
-struct LoadedProfile(Profile);
+struct LoadedProfile(Option<Profile>);
 
 /// Which thread is shown and the order to cycle through them.
 #[derive(Resource)]
@@ -299,42 +307,27 @@ struct TopTable;
 #[derive(Component)]
 struct InfoPanel;
 
+/// Centred prompt shown while no profile is loaded, inviting the user to drop a
+/// file onto the window. Doubles as the place load errors are reported.
+#[derive(Component)]
+struct DropPrompt;
+
 fn main() {
-    let path = match profile_path() {
-        Some(path) => path,
-        None => {
-            eprintln!("usage: flamegraph-viewer <profile-file>");
-            process::exit(2);
-        }
-    };
-
-    let profile = match parsers::load(&path) {
-        Ok(profile) => profile,
-        Err(err) => {
-            eprintln!("failed to load {}: {err}", path.display());
-            process::exit(1);
-        }
-    };
-
-    if profile.is_empty() {
-        eprintln!("{} contains no samples", path.display());
-        process::exit(1);
-    }
-
-    let order = profile.threads_by_samples();
-
     App::new()
         .add_plugins(DefaultPlugins.set(WindowPlugin {
             primary_window: Some(Window {
-                title: format!("flamegraph-viewer — {}", path.display()),
+                title: "flamegraph-viewer".to_string(),
                 resolution: WindowResolution::new(X_EXTENT as u32 * 2, Y_EXTENT as u32 * 2)
                     .with_scale_factor_override(1.0),
                 ..default()
             }),
             ..default()
         }))
-        .insert_resource(LoadedProfile(profile))
-        .insert_resource(ThreadView { order, cursor: 0 })
+        .insert_resource(LoadedProfile(None))
+        .insert_resource(ThreadView {
+            order: Vec::new(),
+            cursor: 0,
+        })
         .insert_resource(ViewMode::Overview)
         .insert_resource(TopSort::SelfTime)
         .init_resource::<FuncStats>()
@@ -346,6 +339,7 @@ fn main() {
         .add_systems(
             Update,
             (
+                handle_file_drop,
                 switch_thread,
                 toggle_view,
                 overview_input,
@@ -357,21 +351,11 @@ fn main() {
                 update_hover,
                 update_tick_annotation,
                 update_info_panel,
+                update_chrome_visibility,
             )
                 .chain(),
         )
         .run();
-}
-
-/// The profile path from the command line, falling back to a bundled sample.
-fn profile_path() -> Option<PathBuf> {
-    if let Some(arg) = std::env::args().nth(1) {
-        return Some(PathBuf::from(arg));
-    }
-    ["perf.json", "out.perf"]
-        .into_iter()
-        .map(PathBuf::from)
-        .find(|p| p.exists())
 }
 
 fn setup(
@@ -447,6 +431,28 @@ fn setup(
         Visibility::Hidden,
         TickAnnotation,
     ));
+
+    // Full-screen container that centres the drop prompt; the prompt text itself
+    // carries the marker so its visibility can be toggled and load errors written
+    // to it (see `update_chrome_visibility` and `handle_file_drop`).
+    commands
+        .spawn(Node {
+            position_type: PositionType::Absolute,
+            width: Val::Percent(100.0),
+            height: Val::Percent(100.0),
+            align_items: AlignItems::Center,
+            justify_content: JustifyContent::Center,
+            ..default()
+        })
+        .with_children(|parent| {
+            parent.spawn((
+                Text::new(DROP_PROMPT),
+                TextFont::from_font_size(28.0),
+                TextColor(Color::srgb(0.85, 0.87, 0.92)),
+                TextLayout::new_with_justify(Justify::Center),
+                DropPrompt,
+            ));
+        });
 }
 
 /// Cycle the displayed thread with the `[` and `]` keys.
@@ -534,19 +540,27 @@ fn rebuild_flamegraph(
         camera.translation.y = 0.0;
     }
 
+    let Some(loaded) = profile.0.as_ref() else {
+        // No profile yet: leave the window empty behind the drop prompt.
+        if let Ok(mut text) = indicator.single_mut() {
+            text.0 = String::new();
+        }
+        return;
+    };
+
     let Some(&thread_idx) = view.order.get(view.cursor) else {
         return;
     };
-    let thread = &profile.0.threads[thread_idx];
+    let thread = &loaded.threads[thread_idx];
 
     let rows = flame::flat_profile(thread);
     stats.by_key = rows.iter().cloned().map(|r| (r.key.clone(), r)).collect();
     stats.total_events = thread.event_count();
     stats.rows = rows;
 
-    let profile_start = profile.0.start_ns().unwrap_or(0.0);
+    let profile_start = loaded.start_ns().unwrap_or(0.0);
     match *mode {
-        ViewMode::Overview => spawn_overview(&mut commands, &shared, &profile.0, &view, &mut overview),
+        ViewMode::Overview => spawn_overview(&mut commands, &shared, loaded, &view, &mut overview),
         ViewMode::FlameChart => {
             spawn_bricks(&mut commands, &shared, &mut row_height, thread, false, profile_start)
         }
@@ -581,11 +595,100 @@ fn rebuild_flamegraph(
                 thread.samples.len(),
                 thread.event_count(),
                 thread.max_depth(),
-                thread_timing_summary(&profile.0, thread),
+                thread_timing_summary(loaded, thread),
                 mode.label(),
                 sort_hint,
             )
         };
+    }
+}
+
+/// Load a profile when a file is dropped on the window. On success this swaps in
+/// the new [`LoadedProfile`], resets the thread selection to the overview (which
+/// triggers a rebuild) and retitles the window; on failure it reports the error
+/// in the drop prompt and leaves the current state untouched.
+fn handle_file_drop(
+    mut drops: MessageReader<FileDragAndDrop>,
+    mut profile: ResMut<LoadedProfile>,
+    mut view: ResMut<ThreadView>,
+    mut mode: ResMut<ViewMode>,
+    mut windows: Query<&mut Window, With<PrimaryWindow>>,
+    mut prompt: Query<&mut Text, With<DropPrompt>>,
+) {
+    // Only the last dropped file matters; act on it once the batch is drained.
+    let Some(path) = drops.read().find_map(|event| match event {
+        FileDragAndDrop::DroppedFile { path_buf, .. } => Some(path_buf.clone()),
+        _ => None,
+    }) else {
+        return;
+    };
+
+    let result = parsers::load(&path).and_then(|profile| {
+        if profile.is_empty() {
+            Err(format!("{} contains no samples", path.display()).into())
+        } else {
+            Ok(profile)
+        }
+    });
+
+    match result {
+        Ok(loaded) => {
+            *view = ThreadView {
+                order: loaded.threads_by_samples(),
+                cursor: 0,
+            };
+            *mode = ViewMode::Overview;
+            *profile = LoadedProfile(Some(loaded));
+            if let Ok(mut window) = windows.single_mut() {
+                window.title = format!("flamegraph-viewer — {}", path.display());
+            }
+        }
+        Err(err) => {
+            if let Ok(mut text) = prompt.single_mut() {
+                text.0 = format!("Could not open {}\n\n{err}\n\n{DROP_PROMPT}", path.display());
+            }
+        }
+    }
+}
+
+/// Show the drop prompt (and hide the chart chrome) while no profile is loaded,
+/// and the reverse once one is. Runs only when [`LoadedProfile`] changes.
+fn update_chrome_visibility(
+    profile: Res<LoadedProfile>,
+    mut prompt: Query<
+        &mut Visibility,
+        (With<DropPrompt>, Without<InfoPanel>, Without<ThreadIndicator>),
+    >,
+    mut info: Query<
+        &mut Visibility,
+        (With<InfoPanel>, Without<DropPrompt>, Without<ThreadIndicator>),
+    >,
+    mut indicator: Query<
+        &mut Visibility,
+        (With<ThreadIndicator>, Without<DropPrompt>, Without<InfoPanel>),
+    >,
+) {
+    if !profile.is_changed() {
+        return;
+    }
+    let loaded = profile.0.is_some();
+    let chrome = if loaded {
+        Visibility::Inherited
+    } else {
+        Visibility::Hidden
+    };
+    if let Ok(mut v) = prompt.single_mut() {
+        *v = if loaded {
+            Visibility::Hidden
+        } else {
+            Visibility::Visible
+        };
+    }
+    if let Ok(mut v) = info.single_mut() {
+        *v = chrome;
+    }
+    if let Ok(mut v) = indicator.single_mut() {
+        *v = chrome;
     }
 }
 
