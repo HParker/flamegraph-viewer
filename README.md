@@ -1,14 +1,9 @@
 # flamegraph-viewer
 
-An interactive flame graph viewer and profile analyser for native programs. It
-reads three common profile formats into one in-memory model and lets you explore
-where a program spends its time — either visually (a Bevy GUI) or from the
-command line (LLM- and script-friendly output).
+This program loads profile data from `perf` or in the Gecko format and displays it locally.
+It is written in Rust using the Bevy game engine. AI was used in the creation of this project.
 
-## Screenshots
-
-The GUI opens on a drop target; drag any supported profile onto the window to
-load it:
+Drag a profile onto the window to open it:
 
 ![The viewer's empty drop target, prompting you to drag a profile file
 onto the window](img/drag-and-drop.png)
@@ -17,6 +12,10 @@ Once loaded it shows a **thread overview** — one full-width, time-aligned
 preview per thread (busiest first), so you can see at a glance which threads were
 active when. Pick one with the arrow keys or mouse:
 
+The default screen shows an overview of each process/thread in your profile. Samples
+are alligned based on timestamp, so samples in this view should align when they
+happen at the same time.
+
 ![Thread overview: every thread rendered as a full-width flame-chart preview on a
 shared time axis, the busiest thread selected at the top](img/thread-overview.png)
 
@@ -24,6 +23,10 @@ Opening a thread shows its detailed **time-ordered flame chart**, with a header
 of timing stats and controls. Hover a brick for its self / total time, zoom the
 time and depth axes, and hold `Alt` to reveal per-sample tick lines and
 timestamps:
+
+Hitting enter or clicking on a thread opens a more detailed view. The default view
+places samples in time order Use `TAB` to cycle through different modes
+(time order, left heavy and top list).
 
 ![Thread detail: a time-ordered flame chart for a single thread, with the call
 stack growing upward and a stats header at the top](img/thread-detail.png)
@@ -68,6 +71,7 @@ Then convert `perf.data` into one of the two text formats the viewer reads.
 
 ```sh
 # Reads ./perf.data by default; -i points at a specific file.
+# These two lines are equivalent
 perf script > out.perf
 perf script -i perf.data > out.perf
 ```
@@ -152,23 +156,6 @@ hotspots <profile> [--format table|tree|json] [--top N]
 - `--top N` – limit table rows / tree breadth (default 20).
 - `--thread N` – inspect one thread (default: the busiest); `--all` for every thread.
 - `--offset` – keep `+0x…` offsets instead of grouping by function.
-
-## Validation
-
-Accuracy is checked against `perf`'s own numbers and the external
-[`inferno`](https://github.com/jonhoo/inferno) collapser as an offline ground
-truth:
-
-```sh
-cargo test            # unit + cross-tool validation tests
-./scripts/validate.sh # runs the tests and validates any real files present
-```
-
-`tests/external_tools.rs` cross-checks per-function self/total event counts
-against `inferno-collapse-perf` when it is installed (the test is skipped if it
-is not). `tests/consistency.rs` re-derives every thread's call tree with an
-independent oracle and asserts the conservation laws `self + Σchild.total =
-total` hold throughout.
 
 ## Layout / source map
 
