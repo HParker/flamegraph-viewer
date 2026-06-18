@@ -17,6 +17,8 @@
 //! * `Z` / `X`  – zoom out / in (time axis)
 //! * `C` / `V`  – zoom out / in (depth axis)
 //! * `[` / `]`  – switch to the previous / next thread
+//! * `/`        – in a detail view, search functions by name: type to highlight
+//!   every matching brick / row, `Enter` keeps the highlight, `Esc` clears it
 //! * hold `Alt`  – reveal the per-sample tick lines in the flame chart and read
 //!   the timestamp of the tick nearest the cursor
 //! * hover      – highlight the brick under the cursor and every brick that
@@ -34,7 +36,12 @@ use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 
 use bevy::{
-    prelude::*, sprite::Anchor, window::FileDragAndDrop, window::PrimaryWindow,
+    input::keyboard::{Key, KeyboardInput},
+    input::ButtonState,
+    prelude::*,
+    sprite::Anchor,
+    window::FileDragAndDrop,
+    window::PrimaryWindow,
     window::WindowResolution,
 };
 
@@ -104,6 +111,14 @@ const DROP_PROMPT: &str =
     "Drop a profile file here to open it\n\nperf script, perf JSON, or Firefox/Gecko JSON";
 
 const PALETTE_SIZE: usize = 64;
+
+/// Highlight colour for bricks (and top-table rows) whose function name matches
+/// the active search query. Deliberately distinct from the hover colours
+/// (white / orange) and the muted HSL palette so matches jump out.
+const SEARCH_COLOR: Color = Color::srgb(1.0, 0.25, 0.85);
+
+/// Default colour of a top-table row; matching rows switch to [`SEARCH_COLOR`].
+const TOP_TEXT_COLOR: Color = Color::srgb(0.9, 0.9, 0.95);
 
 /// The whole parsed profile.
 /// The profile currently being viewed, or `None` before any file is dropped on
@@ -188,6 +203,8 @@ struct SharedAssets {
     hover_self: Handle<ColorMaterial>,
     /// Highlight for other bricks sharing the hovered symbol.
     hover_group: Handle<ColorMaterial>,
+    /// Highlight for bricks whose function name matches the active search.
+    search_match: Handle<ColorMaterial>,
     /// Faint overlay colour for the per-sample timestamp tick lines.
     tick: Handle<ColorMaterial>,
     /// Background panel behind each overview thumbnail.
@@ -212,6 +229,39 @@ struct Hover {
     key: Option<String>,
 }
 
+/// Live function-name search shared by the three detail views. While `active`
+/// the typed query is captured character by character (and the normal keyboard
+/// shortcuts are suppressed); any brick or top-table row whose function name
+/// contains the query (case-insensitively) is highlighted.
+#[derive(Resource, Default)]
+struct Search {
+    query: String,
+    active: bool,
+}
+
+impl Search {
+    /// The lower-cased needle to match against, or `None` when the query is
+    /// empty (nothing highlighted).
+    fn needle(&self) -> Option<String> {
+        let trimmed = self.query.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_lowercase())
+        }
+    }
+
+    fn clear(&mut self) {
+        self.query.clear();
+        self.active = false;
+    }
+}
+
+/// True when `key` contains the search `needle` (already lower-cased).
+fn matches_needle(key: &str, needle: &str) -> bool {
+    key.to_lowercase().contains(needle)
+}
+
 /// Current flame-chart row height, fitted to the displayed thread's depth and
 /// adjustable with the vertical-zoom keys.
 #[derive(Resource)]
@@ -220,6 +270,21 @@ struct RowHeight(f32);
 impl Default for RowHeight {
     fn default() -> Self {
         RowHeight(ROW_HEIGHT)
+    }
+}
+
+/// Current horizontal zoom: world units per axis unit (nanoseconds for the time
+/// chart, events for the left-heavy graph). Fitted to the view on rebuild and
+/// scaled by the time-zoom keys. This is the horizontal companion of
+/// [`RowHeight`] (vertical zoom); together they map a brick's profile-space
+/// geometry to the screen. The factor is identical for every brick, label and
+/// sample tick, so it lives here once instead of being copied onto each entity.
+#[derive(Resource)]
+struct Zoom(f32);
+
+impl Default for Zoom {
+    fn default() -> Self {
+        Zoom(1.0)
     }
 }
 
@@ -255,25 +320,21 @@ struct BrickView {
     base_material: Handle<ColorMaterial>,
 }
 
-/// Brick geometry in profile (nanosecond) units, kept so the brick can be
-/// repositioned when the view is zoomed.
+/// A brick's immutable layout record in profile units, kept so the entity can
+/// be repositioned when the view is zoomed. Wraps the [`flame::Brick`] produced
+/// by the layout directly instead of re-declaring its geometry; the current
+/// zoom factor is *not* stored here but shared in the [`Zoom`] resource, since
+/// it is identical for every brick.
 #[derive(Component)]
-struct TrueScale {
-    start_ns: f64,
-    width_ns: f64,
-    scale: f32,
-    /// 1-based row, used to recompute vertical position on vertical zoom.
-    depth: usize,
-}
+struct BrickGeometry(flame::Brick);
 
 /// Text drawn on top of a brick, with the geometry needed to reposition and
-/// re-truncate it on zoom.
+/// re-truncate it on zoom. The zoom factor is shared in the [`Zoom`] resource.
 #[derive(Component)]
 struct BrickLabel {
     full: String,
     start_ns: f64,
     width_ns: f64,
-    scale: f32,
     depth: usize,
 }
 
@@ -282,14 +343,14 @@ struct BrickLabel {
 struct ThreadIndicator;
 
 /// A vertical line marking the timestamp of one sample in the flame chart. Its
-/// `offset_ns` (time since the thread's first sample) and `scale` are kept so it
-/// can be repositioned on time zoom, exactly like a brick. `time_ns` is the same
-/// sample's time relative to the *profile* start, used for the Alt annotation.
+/// `offset_ns` (time since the thread's first sample) is kept so it can be
+/// repositioned on time zoom, exactly like a brick, using the shared [`Zoom`].
+/// `time_ns` is the same sample's time relative to the *profile* start, used for
+/// the Alt annotation.
 #[derive(Component)]
 struct SampleTick {
     offset_ns: f64,
     time_ns: f64,
-    scale: f32,
 }
 
 /// The single floating label that, while `Alt` is held, reports the timestamp of
@@ -301,9 +362,21 @@ struct TickAnnotation;
 #[derive(Component)]
 struct TopTable;
 
+/// One row of the top-functions table, carrying its function key so the search
+/// highlighter can recolour matching rows independently.
+#[derive(Component)]
+struct TopRow {
+    key: String,
+}
+
 /// On-screen panel showing the clicked symbol's timing.
 #[derive(Component)]
 struct InfoPanel;
+
+/// Search readout shown in the detail views: the current query and how many
+/// functions match it. Hidden in the overview.
+#[derive(Component)]
+struct SearchBar;
 
 /// Centred prompt shown while no profile is loaded, inviting the user to drop a
 /// file onto the window. Doubles as the place load errors are reported.
@@ -330,7 +403,9 @@ fn main() {
         .insert_resource(TopSort::SelfTime)
         .init_resource::<FuncStats>()
         .init_resource::<Hover>()
+        .init_resource::<Search>()
         .init_resource::<RowHeight>()
+        .init_resource::<Zoom>()
         .init_resource::<TopFontSize>()
         .init_resource::<OverviewLayout>()
         .add_systems(Startup, setup)
@@ -338,6 +413,7 @@ fn main() {
             Update,
             (
                 handle_file_drop,
+                search_input,
                 switch_thread,
                 toggle_view,
                 overview_input,
@@ -347,9 +423,12 @@ fn main() {
                 zoom_ticks,
                 resize_top_font,
                 update_hover,
+                recolor_bricks,
+                recolor_top_rows,
                 toggle_sample_ticks,
                 update_tick_annotation,
                 update_info_panel,
+                update_search_bar,
                 update_chrome_visibility,
             )
                 .chain(),
@@ -373,6 +452,7 @@ fn setup(
         .collect();
     let hover_self = materials.add(Color::srgb(1.0, 1.0, 1.0));
     let hover_group = materials.add(Color::srgb(1.0, 0.75, 0.2));
+    let search_match = materials.add(SEARCH_COLOR);
     // Translucent so the bricks beneath a tick stay visible through it.
     let tick = materials.add(Color::srgba(0.85, 0.9, 1.0, 0.08));
     let cell_bg = materials.add(Color::srgb(0.12, 0.12, 0.15));
@@ -383,6 +463,7 @@ fn setup(
         palette,
         hover_self,
         hover_group,
+        search_match,
         tick,
         cell_bg,
         cell_selected,
@@ -416,6 +497,23 @@ fn setup(
             ..default()
         },
         InfoPanel,
+    ));
+
+    // Search readout, shown only in the detail views (see `update_search_bar`).
+    commands.spawn((
+        Text::new(String::new()),
+        TextFont::from_font_size(16.0),
+        TextColor(Color::srgb(0.95, 0.85, 0.95)),
+        BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.6)),
+        Node {
+            position_type: PositionType::Absolute,
+            bottom: Val::Px(8.0),
+            left: Val::Px(8.0),
+            padding: UiRect::all(Val::Px(6.0)),
+            ..default()
+        },
+        Visibility::Hidden,
+        SearchBar,
     ));
 
     // A single reusable label, shown only while Alt is held, that snaps to the
@@ -455,7 +553,14 @@ fn setup(
 }
 
 /// Cycle the displayed thread with the `[` and `]` keys.
-fn switch_thread(keyboard: Res<ButtonInput<KeyCode>>, mut view: ResMut<ThreadView>) {
+fn switch_thread(
+    keyboard: Res<ButtonInput<KeyCode>>,
+    search: Res<Search>,
+    mut view: ResMut<ThreadView>,
+) {
+    if search.active {
+        return;
+    }
     let count = view.order.len();
     if count < 2 {
         return;
@@ -471,9 +576,13 @@ fn switch_thread(keyboard: Res<ButtonInput<KeyCode>>, mut view: ResMut<ThreadVie
 /// the top-table sort order.
 fn toggle_view(
     keyboard: Res<ButtonInput<KeyCode>>,
+    search: Res<Search>,
     mut mode: ResMut<ViewMode>,
     mut sort: ResMut<TopSort>,
 ) {
+    if search.active {
+        return;
+    }
     if keyboard.just_pressed(KeyCode::Tab) {
         *mode = mode.next();
     }
@@ -485,6 +594,111 @@ fn toggle_view(
     if keyboard.just_pressed(KeyCode::KeyS) && *mode == ViewMode::Top {
         *sort = sort.next();
     }
+}
+
+/// Capture the function-name search query in the detail views. `/` opens the
+/// search (re-opening keeps the current query for editing); typing edits it,
+/// `Backspace` deletes, `Enter` commits (keeping the highlight) and `Esc`
+/// clears it. While the search is active the normal keyboard shortcuts are
+/// suppressed (every shortcut system early-returns on `search.active`), and the
+/// `Esc` that clears the search is consumed so it does not also return to the
+/// overview in the same frame.
+fn search_input(
+    mut events: MessageReader<KeyboardInput>,
+    mut keyboard: ResMut<ButtonInput<KeyCode>>,
+    mode: Res<ViewMode>,
+    mut search: ResMut<Search>,
+) {
+    for event in events.read() {
+        // Always drain the queue, but only act on the per-thread detail views;
+        // this keeps a keypress made in the overview from leaking into a view
+        // opened later in the same frame.
+        if *mode == ViewMode::Overview || event.state != ButtonState::Pressed {
+            continue;
+        }
+        if apply_search_key(&mut search, &classify_key(event)) == SearchAction::ConsumeEscape {
+            // Stop the same Esc from also returning to the overview this frame.
+            keyboard.clear_just_pressed(KeyCode::Escape);
+        }
+    }
+}
+
+/// A keypress reduced to the cases the search box cares about.
+#[derive(Debug, PartialEq, Eq)]
+enum SearchKey {
+    /// The `/` that opens the box (or a literal slash once it is open).
+    Slash,
+    Escape,
+    Enter,
+    Backspace,
+    /// Printable text produced by the key (e.g. a letter, digit or space).
+    Text(String),
+    /// Anything else (modifiers, arrows, …): ignored by the search box.
+    Other,
+}
+
+/// What the caller must do after [`apply_search_key`] processed a key.
+#[derive(Debug, PartialEq, Eq)]
+enum SearchAction {
+    None,
+    /// The key cleared the search; the `Esc` must be consumed so it does not
+    /// also trigger the return-to-overview shortcut.
+    ConsumeEscape,
+}
+
+/// Reduce a keyboard event to the [`SearchKey`] the search box reacts to.
+fn classify_key(event: &KeyboardInput) -> SearchKey {
+    match &event.logical_key {
+        Key::Escape => SearchKey::Escape,
+        Key::Enter => SearchKey::Enter,
+        Key::Backspace => SearchKey::Backspace,
+        key if is_slash(key) => SearchKey::Slash,
+        _ => match &event.text {
+            Some(text) => SearchKey::Text(text.to_string()),
+            None => SearchKey::Other,
+        },
+    }
+}
+
+/// Apply one classified keypress to the search state (already known to be in a
+/// detail view). Returns whether the `Esc` that cleared the search must be
+/// consumed by the caller.
+fn apply_search_key(search: &mut Search, key: &SearchKey) -> SearchAction {
+    if !search.active {
+        // While the box is closed only `/` matters; every other key keeps its
+        // normal shortcut behaviour.
+        if *key == SearchKey::Slash {
+            search.active = true;
+        }
+        return SearchAction::None;
+    }
+
+    match key {
+        SearchKey::Escape => {
+            search.clear();
+            return SearchAction::ConsumeEscape;
+        }
+        SearchKey::Enter => search.active = false,
+        SearchKey::Backspace => {
+            search.query.pop();
+        }
+        // An open box treats `/` as a literal character to search for.
+        SearchKey::Slash => search.query.push('/'),
+        SearchKey::Text(text) => {
+            for c in text.chars() {
+                if !c.is_control() {
+                    search.query.push(c);
+                }
+            }
+        }
+        SearchKey::Other => {}
+    }
+    SearchAction::None
+}
+
+/// Whether a logical key is the `/` that opens the search box.
+fn is_slash(key: &Key) -> bool {
+    matches!(key, Key::Character(s) if s.as_str() == "/")
 }
 
 /// Initial scale (world units per axis unit) that fits a layout `width` units
@@ -516,7 +730,9 @@ fn rebuild_flamegraph(
     top_font: Res<TopFontSize>,
     mut stats: ResMut<FuncStats>,
     mut hover: ResMut<Hover>,
+    mut search: ResMut<Search>,
     mut row_height: ResMut<RowHeight>,
+    mut zoom: ResMut<Zoom>,
     mut overview: ResMut<OverviewLayout>,
     existing: Query<Entity, With<FlamegraphEntity>>,
     mut indicator: Query<&mut Text, With<ThreadIndicator>>,
@@ -558,15 +774,32 @@ fn rebuild_flamegraph(
     stats.rows = rows;
 
     let profile_start = loaded.start_ns().unwrap_or(0.0);
+    let needle = search.needle();
     match *mode {
-        ViewMode::Overview => spawn_overview(&mut commands, &shared, loaded, &view, &mut overview),
-        ViewMode::FlameChart => {
-            spawn_bricks(&mut commands, &shared, &mut row_height, thread, false, profile_start)
+        ViewMode::Overview => {
+            // The search bar and highlight belong to the detail views; leaving
+            // to the overview drops the query so re-opening a thread is clean.
+            if !search.query.is_empty() || search.active {
+                search.clear();
+            }
+            spawn_overview(&mut commands, &shared, loaded, &view, &mut overview);
         }
-        ViewMode::FlameGraph => {
-            spawn_bricks(&mut commands, &shared, &mut row_height, thread, true, profile_start)
+        ViewMode::FlameChart | ViewMode::FlameGraph => {
+            // Fit both zoom axes to the thread, then spawn; the returned fit
+            // scale becomes the shared horizontal zoom (`RowHeight` is the
+            // vertical one).
+            row_height.0 = fit_row_height(thread);
+            zoom.0 = spawn_bricks(
+                &mut commands,
+                &shared,
+                row_height.0,
+                thread,
+                *mode == ViewMode::FlameGraph,
+                profile_start,
+                needle.as_deref(),
+            );
         }
-        ViewMode::Top => spawn_top_table(&mut commands, &stats, *sort, top_font.0),
+        ViewMode::Top => spawn_top_table(&mut commands, &stats, *sort, top_font.0, needle.as_deref()),
     }
 
     if let Ok(mut text) = indicator.single_mut() {
@@ -587,7 +820,7 @@ fn rebuild_flamegraph(
                 "Thread {}/{}: {}  ({} samples, {} events, depth {})\n\
                  {}\n\
                  view: {}  ·  Tab switch view{}\n\
-                 [ ] thread  ·  arrows pan  ·  Z/X time zoom  ·  C/V depth zoom  ·  hold Alt: sample ticks + timestamps",
+                 [ ] thread  ·  arrows pan  ·  Z/X time zoom  ·  C/V depth zoom  ·  / search  ·  hold Alt: sample ticks + timestamps",
                 view.cursor + 1,
                 view.order.len(),
                 thread.label(),
@@ -872,17 +1105,17 @@ fn spawn_thumbnail(
 /// Lay out the current thread as bricks, either time-ordered ([`flame::layout`])
 /// or left-heavy ([`flame::left_heavy`]), and spawn them. Both layouts share the
 /// same brick geometry; only the x-axis unit differs (time vs events), which is
-/// absorbed into the fit `scale`.
+/// absorbed into the fit scale. Returns that fit scale so the caller can store
+/// it as the initial [`Zoom`]; `row_height` is the already-fitted [`RowHeight`].
 fn spawn_bricks(
     commands: &mut Commands,
     shared: &SharedAssets,
-    row_height: &mut RowHeight,
+    row_height: f32,
     thread: &Thread,
     left_heavy: bool,
     profile_start: f64,
-) {
-    row_height.0 = fit_row_height(thread);
-
+    needle: Option<&str>,
+) -> f32 {
     let bricks = if left_heavy {
         flame::left_heavy(thread)
     } else {
@@ -893,18 +1126,20 @@ fn spawn_bricks(
     };
 
     // Fit the whole layout across the view: its total width is the last brick's
-    // right edge (time span, or total events for the left-heavy graph).
+    // right edge (time span, or total events for the left-heavy graph). This is
+    // the shared zoom every brick, label and tick is positioned with.
     let width: f64 = bricks
         .iter()
         .map(|b| b.start_ns + b.width_ns)
         .fold(0.0, f64::max);
     let scale = fit_scale(width);
 
-    for brick in &bricks {
+    for brick in bricks {
         if (brick.width_ns as f32 * scale) < MIN_BRICK_PX {
             continue;
         }
-        spawn_brick(commands, shared, brick, thread.key(brick.frame), scale, row_height.0);
+        let key = thread.key(brick.frame);
+        spawn_brick(commands, shared, brick, key, scale, row_height, needle);
     }
 
     // Overlay a tick at each sample's timestamp on the time-ordered chart so it
@@ -913,6 +1148,7 @@ fn spawn_bricks(
     if !left_heavy {
         spawn_ticks(commands, shared, thread, scale, profile_start);
     }
+    scale
 }
 
 /// World-space x of a sample taken `offset_ns` after the thread's first sample.
@@ -955,59 +1191,87 @@ fn spawn_ticks(
             SampleTick {
                 offset_ns: offset,
                 time_ns: sample.timestamp_ns - profile_start,
-                scale,
             },
             FlamegraphEntity,
         ));
     }
 }
 
-/// Spawn the flat function table for [`ViewMode::Top`] as a single text block.
-fn spawn_top_table(commands: &mut Commands, stats: &FuncStats, sort: TopSort, font_size: f32) {
-    commands.spawn((
-        Text::new(top_table_text(stats, sort)),
-        TextFont::from_font_size(font_size),
-        TextColor(Color::srgb(0.9, 0.9, 0.95)),
-        Node {
-            position_type: PositionType::Absolute,
-            top: Val::Px(112.0),
-            left: Val::Px(8.0),
-            ..default()
-        },
-        TopTable,
-        FlamegraphEntity,
-    ));
+/// Header row shared by every sort order of the top-functions table.
+const TOP_TABLE_HEADER: &str = "  self%   self time   total time  function\n";
+
+/// Spawn the flat function table for [`ViewMode::Top`]. The header is the root
+/// text and each function is a child [`TextSpan`] tagged with its key, so the
+/// search highlighter can recolour matching rows in place ([`recolor_top_rows`])
+/// without rebuilding the table. Rows matching the active search are spawned
+/// already highlighted.
+fn spawn_top_table(
+    commands: &mut Commands,
+    stats: &FuncStats,
+    sort: TopSort,
+    font_size: f32,
+    needle: Option<&str>,
+) {
+    let font = TextFont::from_font_size(font_size);
+    commands
+        .spawn((
+            Text::new(TOP_TABLE_HEADER),
+            font.clone(),
+            TextColor(TOP_TEXT_COLOR),
+            Node {
+                position_type: PositionType::Absolute,
+                top: Val::Px(112.0),
+                left: Val::Px(8.0),
+                ..default()
+            },
+            TopTable,
+            FlamegraphEntity,
+        ))
+        .with_children(|parent| {
+            for row in top_table_rows(stats, sort) {
+                let color = if needle.is_some_and(|n| matches_needle(&row.key, n)) {
+                    SEARCH_COLOR
+                } else {
+                    TOP_TEXT_COLOR
+                };
+                parent.spawn((
+                    TextSpan::new(format_top_row(stats, &row)),
+                    font.clone(),
+                    TextColor(color),
+                    TopTable,
+                    TopRow { key: row.key },
+                ));
+            }
+        });
 }
 
-/// Render up to 40 of the hottest functions as an aligned, sortable table. This
-/// is the view that points straight at the code worth optimising.
-fn top_table_text(stats: &FuncStats, sort: TopSort) -> String {
+/// Up to 40 of the hottest functions, ordered by the requested column. This is
+/// the view that points straight at the code worth optimising.
+fn top_table_rows(stats: &FuncStats, sort: TopSort) -> Vec<FunctionStat> {
     let mut rows = stats.rows.clone();
     match sort {
         TopSort::SelfTime => rows.sort_by(|a, b| b.self_ns.total_cmp(&a.self_ns)),
         TopSort::TotalTime => rows.sort_by(|a, b| b.total_ns.total_cmp(&a.total_ns)),
         TopSort::Name => rows.sort_by(|a, b| a.key.cmp(&b.key)),
     }
+    rows.truncate(40);
+    rows
+}
 
-    let pct = |events: u64| {
-        if stats.total_events == 0 {
-            0.0
-        } else {
-            events as f64 / stats.total_events as f64 * 100.0
-        }
+/// Format one aligned table line (with trailing newline) for a function row.
+fn format_top_row(stats: &FuncStats, row: &FunctionStat) -> String {
+    let pct = if stats.total_events == 0 {
+        0.0
+    } else {
+        row.self_events as f64 / stats.total_events as f64 * 100.0
     };
-
-    let mut out = String::from("  self%   self time   total time  function\n");
-    for row in rows.iter().take(40) {
-        out.push_str(&format!(
-            "  {:>5.1}  {:>10}  {:>11}  {}\n",
-            pct(row.self_events),
-            format_ns(row.self_ns),
-            format_ns(row.total_ns),
-            truncate_name(&row.key, 70),
-        ));
-    }
-    out
+    format!(
+        "  {:>5.1}  {:>10}  {:>11}  {}\n",
+        pct,
+        format_ns(row.self_ns),
+        format_ns(row.total_ns),
+        truncate_name(&row.key, 70),
+    )
 }
 
 /// Truncate an over-long symbol so the table stays readable.
@@ -1025,16 +1289,26 @@ fn truncate_name(name: &str, max: usize) -> String {
     format!("{kept}…")
 }
 
-/// Spawn one brick (and its label when it fits) using the shared assets.
+/// Spawn one brick (and its label when it fits) using the shared assets. Takes
+/// the layout `brick` by value and stores it on the entity as [`BrickGeometry`];
+/// `scale` is the current [`Zoom`] used to place it now.
 fn spawn_brick(
     commands: &mut Commands,
     shared: &SharedAssets,
-    brick: &flame::Brick,
+    brick: flame::Brick,
     key: &str,
     scale: f32,
     row_height: f32,
+    needle: Option<&str>,
 ) {
-    let material = shared.palette[palette_index(key)].clone();
+    let base_material = shared.palette[palette_index(key)].clone();
+    // Bricks spawned while a search is active start already highlighted, so the
+    // change-detecting recolour system never has to touch them on rebuild.
+    let display_material = if needle.is_some_and(|n| matches_needle(key, n)) {
+        shared.search_match.clone()
+    } else {
+        base_material.clone()
+    };
 
     let mut transform = Transform::from_xyz(
         brick_center_x(brick.start_ns, brick.width_ns, scale),
@@ -1047,19 +1321,18 @@ fn spawn_brick(
         1.0,
     );
 
+    // Copy out the geometry the label needs before the brick is moved onto the
+    // brick entity.
+    let (start_ns, width_ns, depth) = (brick.start_ns, brick.width_ns, brick.depth);
+
     commands.spawn((
         Mesh2d(shared.mesh.clone()),
-        MeshMaterial2d(material.clone()),
+        MeshMaterial2d(display_material),
         transform,
-        TrueScale {
-            start_ns: brick.start_ns,
-            width_ns: brick.width_ns,
-            scale,
-            depth: brick.depth,
-        },
+        BrickGeometry(brick),
         BrickView {
             key: key.to_string(),
-            base_material: material,
+            base_material,
         },
         FlamegraphEntity,
     ));
@@ -1069,7 +1342,7 @@ fn spawn_brick(
     // whether the text is actually shown also depends on the row being tall
     // enough (see `labels_visible`), so depth-zooming can reveal it later.
     let font_size = label_font_size(row_height);
-    let fitted = fit_label(&full, brick.width_ns, scale, font_size);
+    let fitted = fit_label(&full, width_ns, scale, font_size);
     if fitted.is_empty() {
         return;
     }
@@ -1083,16 +1356,15 @@ fn spawn_brick(
         TextFont::from_font_size(font_size),
         Anchor::CENTER_LEFT,
         Transform::from_xyz(
-            label_left_x(brick.start_ns, scale),
-            brick_y(brick.depth, row_height),
+            label_left_x(start_ns, scale),
+            brick_y(depth, row_height),
             1.0,
         ),
         BrickLabel {
             full,
-            start_ns: brick.start_ns,
-            width_ns: brick.width_ns,
-            scale,
-            depth: brick.depth,
+            start_ns,
+            width_ns,
+            depth,
         },
         FlamegraphEntity,
     ));
@@ -1162,11 +1434,13 @@ fn fit_label(full: &str, width_ns: f64, scale: f32, font_size: f32) -> String {
 fn move_camera(
     keyboard: Res<ButtonInput<KeyCode>>,
     mode: Res<ViewMode>,
+    search: Res<Search>,
     mut query: Query<&mut Transform, With<Camera2d>>,
     time: Res<Time>,
 ) {
-    // In the overview the arrow keys select a thread instead of panning.
-    if *mode == ViewMode::Overview {
+    // In the overview the arrow keys select a thread instead of panning, and
+    // while typing a search query they edit the query instead.
+    if *mode == ViewMode::Overview || search.active {
         return;
     }
     let Ok(mut transform) = query.single_mut() else {
@@ -1260,14 +1534,22 @@ fn overview_input(
 fn zoom_samples(
     keyboard: Res<ButtonInput<KeyCode>>,
     time: Res<Time>,
+    search: Res<Search>,
+    mut zoom: ResMut<Zoom>,
     mut row_height: ResMut<RowHeight>,
-    mut bricks: Query<(&mut Transform, &mut TrueScale), Without<BrickLabel>>,
-    mut labels: Query<(&mut Transform, &mut Text2d, &mut TextFont, &mut BrickLabel), Without<TrueScale>>,
+    mut bricks: Query<(&mut Transform, &BrickGeometry), Without<BrickLabel>>,
+    mut labels: Query<(&mut Transform, &mut Text2d, &mut TextFont, &BrickLabel), Without<BrickGeometry>>,
 ) {
+    if search.active {
+        return;
+    }
     let rate = 1.5 * time.delta_secs();
     let time_factor = axis_factor(&keyboard, KeyCode::KeyX, KeyCode::KeyZ, rate);
     let depth_factor = axis_factor(&keyboard, KeyCode::KeyV, KeyCode::KeyC, rate);
 
+    if time_factor != 1.0 {
+        zoom.0 *= time_factor;
+    }
     if depth_factor != 1.0 {
         row_height.0 *= depth_factor;
     }
@@ -1275,24 +1557,24 @@ fn zoom_samples(
         return;
     }
 
+    let scale = zoom.0;
     let row_height = row_height.0;
     let show_labels = labels_visible(row_height);
     let font_size = label_font_size(row_height);
-    for (mut transform, mut scale) in &mut bricks {
-        scale.scale *= time_factor;
-        transform.translation.x = brick_center_x(scale.start_ns, scale.width_ns, scale.scale);
-        transform.scale.x = scale.width_ns as f32 * scale.scale;
-        transform.translation.y = brick_y(scale.depth, row_height);
+    for (mut transform, geometry) in &mut bricks {
+        let brick = &geometry.0;
+        transform.translation.x = brick_center_x(brick.start_ns, brick.width_ns, scale);
+        transform.scale.x = brick.width_ns as f32 * scale;
+        transform.translation.y = brick_y(brick.depth, row_height);
         transform.scale.y = brick_thickness(row_height);
     }
 
-    for (mut transform, mut text, mut font, mut label) in &mut labels {
-        label.scale *= time_factor;
-        transform.translation.x = label_left_x(label.start_ns, label.scale);
+    for (mut transform, mut text, mut font, label) in &mut labels {
+        transform.translation.x = label_left_x(label.start_ns, scale);
         transform.translation.y = brick_y(label.depth, row_height);
         font.font_size = font_size;
         text.0 = if show_labels {
-            fit_label(&label.full, label.width_ns, label.scale, font_size)
+            fit_label(&label.full, label.width_ns, scale, font_size)
         } else {
             String::new()
         };
@@ -1300,21 +1582,14 @@ fn zoom_samples(
 }
 
 /// Keep the sample-timestamp ticks aligned with the bricks as the time axis is
-/// zoomed (`X`/`Z`). Ticks span the full height, so vertical zoom never touches
-/// them.
-fn zoom_ticks(
-    keyboard: Res<ButtonInput<KeyCode>>,
-    time: Res<Time>,
-    mut ticks: Query<(&mut Transform, &mut SampleTick)>,
-) {
-    let rate = 1.5 * time.delta_secs();
-    let time_factor = axis_factor(&keyboard, KeyCode::KeyX, KeyCode::KeyZ, rate);
-    if time_factor == 1.0 {
+/// zoomed. Ticks span the full height, so vertical zoom never touches them; they
+/// only need repositioning when the shared [`Zoom`] changed.
+fn zoom_ticks(zoom: Res<Zoom>, mut ticks: Query<(&mut Transform, &SampleTick)>) {
+    if !zoom.is_changed() {
         return;
     }
-    for (mut transform, mut tick) in &mut ticks {
-        tick.scale *= time_factor;
-        transform.translation.x = tick_x(tick.offset_ns, tick.scale);
+    for (mut transform, tick) in &mut ticks {
+        transform.translation.x = tick_x(tick.offset_ns, zoom.0);
     }
 }
 
@@ -1325,10 +1600,11 @@ fn resize_top_font(
     keyboard: Res<ButtonInput<KeyCode>>,
     time: Res<Time>,
     mode: Res<ViewMode>,
+    search: Res<Search>,
     mut size: ResMut<TopFontSize>,
     mut tables: Query<&mut TextFont, With<TopTable>>,
 ) {
-    if *mode != ViewMode::Top {
+    if *mode != ViewMode::Top || search.active {
         return;
     }
     let rate = 24.0 * time.delta_secs();
@@ -1393,13 +1669,14 @@ fn brick_at<'a>(
     best.map(|(entity, key, _)| (entity, key))
 }
 
-/// Highlight the hovered brick and every brick sharing its symbol.
+/// Track which brick (and symbol) the cursor is over, recording it in [`Hover`]
+/// so the colouring system and info panel can react. Only the hover *state* is
+/// updated here; [`recolor_bricks`] turns it (and the search) into colours.
 fn update_hover(
     windows: Query<&Window, With<PrimaryWindow>>,
     cameras: Query<(&Camera, &GlobalTransform)>,
-    shared: Res<SharedAssets>,
     mut hover: ResMut<Hover>,
-    mut bricks: Query<(Entity, &Transform, &BrickView, &mut MeshMaterial2d<ColorMaterial>)>,
+    bricks: Query<(Entity, &Transform, &BrickView)>,
 ) {
     let Ok(window) = windows.single() else {
         return;
@@ -1408,13 +1685,11 @@ fn update_hover(
         return;
     };
 
-    let hovered = cursor_world(window, camera, camera_transform).and_then(|point| {
-        brick_at(point, bricks.iter().map(|(e, t, v, _)| (e, t, v)))
-            .map(|(entity, key)| (entity, key.to_string()))
-    });
+    let hovered = cursor_world(window, camera, camera_transform)
+        .and_then(|point| brick_at(point, bricks.iter()).map(|(entity, key)| (entity, key.to_string())));
 
-    let (hovered_entity, hovered_key) = match &hovered {
-        Some((entity, key)) => (Some(*entity), Some(key.clone())),
+    let (hovered_entity, hovered_key) = match hovered {
+        Some((entity, key)) => (Some(entity), Some(key)),
         None => (None, None),
     };
 
@@ -1422,20 +1697,148 @@ fn update_hover(
         return;
     }
     hover.entity = hovered_entity;
-    hover.key = hovered_key.clone();
+    hover.key = hovered_key;
+}
 
-    for (entity, _, view, mut material) in &mut bricks {
-        let desired = if Some(entity) == hovered_entity {
-            shared.hover_self.clone()
-        } else if hovered_key.as_deref() == Some(view.key.as_str()) {
-            shared.hover_group.clone()
-        } else {
-            view.base_material.clone()
-        };
+/// Colour every brick from the current hover and search state: the hovered brick
+/// is white, bricks sharing its symbol are orange, bricks matching the search
+/// query are [`SEARCH_COLOR`], and the rest keep their palette colour. Runs only
+/// when the hover or the search changed, so steady-state panning/zooming is free
+/// (freshly spawned bricks already carry the right search colour, see
+/// [`spawn_brick`]).
+fn recolor_bricks(
+    hover: Res<Hover>,
+    search: Res<Search>,
+    shared: Res<SharedAssets>,
+    mut bricks: Query<(Entity, &BrickView, &mut MeshMaterial2d<ColorMaterial>)>,
+) {
+    if !hover.is_changed() && !search.is_changed() {
+        return;
+    }
+    let needle = search.needle();
+    for (entity, view, mut material) in &mut bricks {
+        let desired = brick_material(entity, view, &hover, needle.as_deref(), &shared);
         if material.0 != desired {
             material.0 = desired;
         }
     }
+}
+
+/// The material a brick should display given the hover and search state.
+fn brick_material(
+    entity: Entity,
+    view: &BrickView,
+    hover: &Hover,
+    needle: Option<&str>,
+    shared: &SharedAssets,
+) -> Handle<ColorMaterial> {
+    match brick_highlight(entity, &view.key, hover, needle) {
+        BrickHighlight::Hovered => shared.hover_self.clone(),
+        BrickHighlight::Group => shared.hover_group.clone(),
+        BrickHighlight::Search => shared.search_match.clone(),
+        BrickHighlight::Base => view.base_material.clone(),
+    }
+}
+
+/// How a brick should be highlighted, in descending priority: the brick under
+/// the cursor, a brick sharing the hovered symbol, a brick matching the search
+/// query, otherwise its plain palette colour.
+#[derive(Debug, PartialEq, Eq)]
+enum BrickHighlight {
+    Hovered,
+    Group,
+    Search,
+    Base,
+}
+
+/// Decide a brick's highlight from the hover and search state. Hover (the
+/// momentary, interactive cue) takes precedence over the search match so the
+/// pointer feedback is never lost, and the search match takes precedence over
+/// the plain palette colour.
+fn brick_highlight(
+    entity: Entity,
+    key: &str,
+    hover: &Hover,
+    needle: Option<&str>,
+) -> BrickHighlight {
+    if hover.entity == Some(entity) {
+        BrickHighlight::Hovered
+    } else if hover.key.as_deref() == Some(key) {
+        BrickHighlight::Group
+    } else if needle.is_some_and(|n| matches_needle(key, n)) {
+        BrickHighlight::Search
+    } else {
+        BrickHighlight::Base
+    }
+}
+
+/// Recolour the top-table rows whose function name matches the search query.
+/// Like the bricks, rows are spawned already highlighted (see [`spawn_top_table`]),
+/// so this only has to react to the query changing while the table is on screen.
+fn recolor_top_rows(search: Res<Search>, mut rows: Query<(&TopRow, &mut TextColor)>) {
+    if !search.is_changed() {
+        return;
+    }
+    let needle = search.needle();
+    for (row, mut color) in &mut rows {
+        let desired = if needle.as_deref().is_some_and(|n| matches_needle(&row.key, n)) {
+            SEARCH_COLOR
+        } else {
+            TOP_TEXT_COLOR
+        };
+        if color.0 != desired {
+            color.0 = desired;
+        }
+    }
+}
+
+/// Show the search query and how many functions in the current thread match it.
+/// The bar is hidden in the overview (search applies to the detail views only).
+fn update_search_bar(
+    search: Res<Search>,
+    stats: Res<FuncStats>,
+    mode: Res<ViewMode>,
+    mut bar: Query<(&mut Text, &mut Visibility), With<SearchBar>>,
+) {
+    if !search.is_changed() && !stats.is_changed() && !mode.is_changed() {
+        return;
+    }
+    let Ok((mut text, mut visibility)) = bar.single_mut() else {
+        return;
+    };
+
+    let visible = *mode != ViewMode::Overview;
+    *visibility = if visible {
+        Visibility::Visible
+    } else {
+        Visibility::Hidden
+    };
+    if !visible {
+        return;
+    }
+
+    text.0 = match search.needle() {
+        Some(needle) => {
+            let matches = stats
+                .rows
+                .iter()
+                .filter(|row| matches_needle(&row.key, &needle))
+                .count();
+            let plural = if matches == 1 { "" } else { "s" };
+            let hint = if search.active {
+                "Enter keep · Esc clear"
+            } else {
+                "/ edit"
+            };
+            let cursor = if search.active { "_" } else { "" };
+            format!(
+                "Search: {}{}   {matches} matching function{plural}   ({hint})",
+                search.query, cursor,
+            )
+        }
+        None if search.active => "Search: _   (type a function name · Esc cancel)".to_string(),
+        None => "Press / to search functions".to_string(),
+    };
 }
 
 /// Sample tick lines are only shown while `Alt` is held — the same modifier that
@@ -1571,5 +1974,140 @@ fn format_ns(ns: f64) -> String {
         format!("{:.3} µs", ns / 1.0e3)
     } else {
         format!("{ns:.0} ns")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn text(s: &str) -> SearchKey {
+        SearchKey::Text(s.to_string())
+    }
+
+    fn feed(search: &mut Search, keys: &[SearchKey]) {
+        for key in keys {
+            apply_search_key(search, key);
+        }
+    }
+
+    #[test]
+    fn needle_is_trimmed_lowercased_and_empty_is_none() {
+        let mut search = Search::default();
+        assert_eq!(search.needle(), None);
+        search.query = "  ".to_string();
+        assert_eq!(search.needle(), None);
+        search.query = "  MainLoop ".to_string();
+        assert_eq!(search.needle().as_deref(), Some("mainloop"));
+    }
+
+    #[test]
+    fn matches_needle_is_case_insensitive_substring() {
+        assert!(matches_needle("std::vec::Vec::push", "push"));
+        assert!(matches_needle("MyType::Render", "render"));
+        assert!(!matches_needle("alloc", "free"));
+    }
+
+    #[test]
+    fn slash_opens_box_without_being_typed() {
+        let mut search = Search::default();
+        // While closed, ordinary keys are ignored (they keep their shortcuts).
+        feed(&mut search, &[text("x"), SearchKey::Backspace, SearchKey::Enter]);
+        assert!(!search.active);
+        assert_eq!(search.query, "");
+
+        feed(&mut search, &[SearchKey::Slash]);
+        assert!(search.active);
+        assert_eq!(search.query, "", "the opening slash is not part of the query");
+    }
+
+    #[test]
+    fn typing_editing_and_committing() {
+        let mut search = Search::default();
+        feed(
+            &mut search,
+            &[SearchKey::Slash, text("m"), text("a"), text("i"), text("n")],
+        );
+        assert_eq!(search.query, "main");
+
+        feed(&mut search, &[SearchKey::Backspace]);
+        assert_eq!(search.query, "mai");
+
+        // Enter commits: the query (and its highlight) survive, input closes.
+        feed(&mut search, &[SearchKey::Enter]);
+        assert!(!search.active);
+        assert_eq!(search.query, "mai");
+
+        // Re-opening keeps the query for editing rather than starting over.
+        feed(&mut search, &[SearchKey::Slash, text("n")]);
+        assert!(search.active);
+        assert_eq!(search.query, "main");
+    }
+
+    #[test]
+    fn open_box_accepts_space_and_literal_slash_but_not_control_chars() {
+        let mut search = Search::default();
+        feed(
+            &mut search,
+            &[SearchKey::Slash, text("a"), SearchKey::Slash, text(" "), text("b")],
+        );
+        assert_eq!(search.query, "a/ b");
+
+        let before = search.query.clone();
+        feed(&mut search, &[text("\u{7}"), SearchKey::Other]);
+        assert_eq!(search.query, before, "control chars and other keys are ignored");
+    }
+
+    #[test]
+    fn escape_clears_and_is_consumed_only_when_active() {
+        // Inactive: Escape is left for the return-to-overview shortcut.
+        let mut search = Search::default();
+        assert_eq!(apply_search_key(&mut search, &SearchKey::Escape), SearchAction::None);
+
+        // Active: Escape clears the query and must be consumed.
+        feed(&mut search, &[SearchKey::Slash, text("f"), text("o")]);
+        assert_eq!(
+            apply_search_key(&mut search, &SearchKey::Escape),
+            SearchAction::ConsumeEscape
+        );
+        assert!(!search.active);
+        assert_eq!(search.query, "");
+    }
+
+    #[test]
+    fn brick_highlight_priority_orders_hover_above_search() {
+        let mut world = World::new();
+        let hovered = world.spawn_empty().id();
+        let other = world.spawn_empty().id();
+
+        // The hovered brick wins even when it also matches the search.
+        let hover = Hover {
+            entity: Some(hovered),
+            key: Some("render".to_string()),
+        };
+        assert_eq!(
+            brick_highlight(hovered, "render", &hover, Some("render")),
+            BrickHighlight::Hovered
+        );
+        // Another brick sharing the hovered symbol is the group colour.
+        assert_eq!(
+            brick_highlight(other, "render", &hover, None),
+            BrickHighlight::Group
+        );
+
+        // With nothing hovered, a search match is highlighted and the rest plain.
+        let idle = Hover::default();
+        assert_eq!(
+            brick_highlight(other, "render", &idle, Some("ren")),
+            BrickHighlight::Search
+        );
+        assert_eq!(
+            brick_highlight(other, "parse", &idle, Some("ren")),
+            BrickHighlight::Base
+        );
+        assert_eq!(
+            brick_highlight(other, "parse", &idle, None),
+            BrickHighlight::Base
+        );
     }
 }

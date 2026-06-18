@@ -121,6 +121,7 @@ detail. Drop another file at any time to switch profiles.
 | `[` / `]`    | switch to the previous / next thread                |
 | `Z` / `X`    | zoom the time axis                                  |
 | `C` / `V`    | zoom the depth axis                                 |
+| `/`          | in a detail view, search functions by name: type to highlight every matching brick / row, `Enter` keeps the highlight, `Esc` clears it |
 | hold `Alt`   | show the per-sample tick lines and read the nearest tick's timestamp |
 | hover        | highlight the brick (and every brick sharing its symbol) and show its self / total time |
 
@@ -140,6 +141,11 @@ Views:
   best for spotting the largest stacks regardless of when they happened.
 - **Top table** – every function with its self and total time, sortable by self
   time, total time, or name; resize the text with `+`/`-`.
+
+In any of the three detail views press `/` to search functions by name: as you
+type, every brick (or top-table row) whose label contains the query is
+highlighted. `Enter` keeps the highlight so you can pan and zoom around the
+matches, and `Esc` clears the search.
 
 ## `hotspots` — machine-friendly bottleneck report
 
